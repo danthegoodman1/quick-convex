@@ -615,7 +615,7 @@ export const garbageCollectPointers = internalMutation({
   handler: async (ctx, args) => {
     const config = await resolveConfig(ctx)
     const now = Date.now()
-    const limit = args.limit ?? 1000
+    const limit = args.limit ?? 100
 
     const pointers = await ctx.db
       .query("queuePointers")
