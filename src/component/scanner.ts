@@ -32,6 +32,7 @@ async function wakeScanner(
   }
 
   if (opts.checkForWork) {
+    // we are checking for we are recovering
     const hasWork = await ctx.db
       .query("queuePointers")
       .withIndex("by_vesting", (q) => q.lte("vestingTime", now))

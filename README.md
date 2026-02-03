@@ -6,6 +6,8 @@ A [QuiCK](https://www.foundationdb.org/files/QuiCK.pdf) implementation as a Conv
 
 **Ordering:** Within a queue zone, you are able to order by insertion time, or by vesting time. This is useful if you would like in-order processing on some partition key (e.g. per-user).
 
+**Recovery:** Because Convex does not have the concept of looping code (at least, not efficiently), we instead optimistically check whether the scanner needs to run on every enqueue. The scanner will re-enqueue itself if there's more work to do. In the event the scanner (or Convex) crashes, there's a 1 minute watchdog cron interval that will wake the scanner if it's not already working.
+
 ---
 
 # Convex Component Template
