@@ -13,7 +13,7 @@ export default defineSchema({
     errorCount: v.number(),
   })
     .index("by_queue_priority_vesting", ["queueId", "priority", "vestingTime"])
-    .index("by_queue_fifo", ["queueId", "priority"]),
+    .index("by_queue_fifo", ["queueId"]),
 
   queuePointers: defineTable({
     queueId: v.string(),

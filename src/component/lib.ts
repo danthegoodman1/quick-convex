@@ -6,6 +6,7 @@ import {
   mutation,
   query,
   type QueryCtx,
+  type MutationCtx,
 } from "./_generated/server.js"
 import { internal } from "./_generated/api.js"
 import schema from "./schema.js"
@@ -28,6 +29,18 @@ const queuePointerValidator = schema.tables.queuePointers.validator.extend({
 export const configValidator = schema.tables.config.validator
 
 export type Config = typeof configValidator.type
+
+const resolvedConfigValidator = v.object({
+  scannerLeaseDurationMs: v.number(),
+  scannerBackoffMinMs: v.number(),
+  scannerBackoffMaxMs: v.number(),
+  pointerBatchSize: v.number(),
+  maxConcurrentManagers: v.number(),
+  defaultPriority: v.number(),
+  defaultLeaseDurationMs: v.number(),
+  minInactiveBeforeDeleteMs: v.number(),
+  maxRetries: v.number(),
+})
 
 export type ResolvedConfig = {
   scannerLeaseDurationMs: number
@@ -53,67 +66,62 @@ const CONFIG_DEFAULTS: ResolvedConfig = {
   maxRetries: MAX_RETRIES,
 }
 
-export async function resolveConfig(ctx: QueryCtx): Promise<ResolvedConfig> {
-  const config = await ctx.db.query("config").first()
-  if (!config) {
-    return CONFIG_DEFAULTS
-  }
+function applyConfigDefaults(partial: Partial<Config> | null | undefined): ResolvedConfig {
+  if (!partial) return CONFIG_DEFAULTS
   return {
-    scannerLeaseDurationMs: config.scannerLeaseDurationMs ?? CONFIG_DEFAULTS.scannerLeaseDurationMs,
-    scannerBackoffMinMs: config.scannerBackoffMinMs ?? CONFIG_DEFAULTS.scannerBackoffMinMs,
-    scannerBackoffMaxMs: config.scannerBackoffMaxMs ?? CONFIG_DEFAULTS.scannerBackoffMaxMs,
-    pointerBatchSize: config.pointerBatchSize ?? CONFIG_DEFAULTS.pointerBatchSize,
-    maxConcurrentManagers: config.maxConcurrentManagers ?? CONFIG_DEFAULTS.maxConcurrentManagers,
-    defaultPriority: config.defaultPriority ?? CONFIG_DEFAULTS.defaultPriority,
-    defaultLeaseDurationMs: config.defaultLeaseDurationMs ?? CONFIG_DEFAULTS.defaultLeaseDurationMs,
-    minInactiveBeforeDeleteMs: config.minInactiveBeforeDeleteMs ?? CONFIG_DEFAULTS.minInactiveBeforeDeleteMs,
-    maxRetries: config.maxRetries ?? CONFIG_DEFAULTS.maxRetries,
+    scannerLeaseDurationMs: partial.scannerLeaseDurationMs ?? CONFIG_DEFAULTS.scannerLeaseDurationMs,
+    scannerBackoffMinMs: partial.scannerBackoffMinMs ?? CONFIG_DEFAULTS.scannerBackoffMinMs,
+    scannerBackoffMaxMs: partial.scannerBackoffMaxMs ?? CONFIG_DEFAULTS.scannerBackoffMaxMs,
+    pointerBatchSize: partial.pointerBatchSize ?? CONFIG_DEFAULTS.pointerBatchSize,
+    maxConcurrentManagers: partial.maxConcurrentManagers ?? CONFIG_DEFAULTS.maxConcurrentManagers,
+    defaultPriority: partial.defaultPriority ?? CONFIG_DEFAULTS.defaultPriority,
+    defaultLeaseDurationMs: partial.defaultLeaseDurationMs ?? CONFIG_DEFAULTS.defaultLeaseDurationMs,
+    minInactiveBeforeDeleteMs: partial.minInactiveBeforeDeleteMs ?? CONFIG_DEFAULTS.minInactiveBeforeDeleteMs,
+    maxRetries: partial.maxRetries ?? CONFIG_DEFAULTS.maxRetries,
   }
 }
 
-export const getConfig = internalQuery({
+export async function resolveConfig(ctx: QueryCtx): Promise<ResolvedConfig> {
+  const config = await ctx.db.query("config").first()
+  return applyConfigDefaults(config)
+}
+
+export const getResolvedConfig = internalQuery({
   args: {},
-  returns: v.object({
-    scannerLeaseDurationMs: v.number(),
-    scannerBackoffMinMs: v.number(),
-    scannerBackoffMaxMs: v.number(),
-    pointerBatchSize: v.number(),
-    maxConcurrentManagers: v.number(),
-    defaultPriority: v.number(),
-    defaultLeaseDurationMs: v.number(),
-    minInactiveBeforeDeleteMs: v.number(),
-    maxRetries: v.number(),
-  }),
+  returns: resolvedConfigValidator,
   handler: async (ctx) => resolveConfig(ctx),
 })
 
-export const upsertConfig = internalMutation({
-  args: {
-    config: configValidator,
-  },
-  returns: v.null(),
-  handler: async (ctx, args) => {
-    const definedFields: Partial<Config> = {}
-    for (const [key, value] of Object.entries(args.config)) {
-      if (value !== undefined) {
-        definedFields[key as keyof Config] = value
-      }
-    }
+async function resolveAndMaybeUpdateConfig(
+  ctx: MutationCtx,
+  updates: Config | undefined
+): Promise<ResolvedConfig> {
+  const existing = await ctx.db.query("config").first()
 
-    if (Object.keys(definedFields).length === 0) {
-      return null
-    }
+  if (!updates) {
+    return applyConfigDefaults(existing)
+  }
 
-    const existing = await ctx.db.query("config").first()
+  const fieldsToUpdate: Partial<Config> = {}
+  for (const [key, value] of Object.entries(updates)) {
+    if (value === undefined) continue
+    const existingValue = existing?.[key as keyof Config]
+    if (existingValue !== value) {
+      fieldsToUpdate[key as keyof Config] = value
+    }
+  }
+
+  if (Object.keys(fieldsToUpdate).length > 0) {
     if (existing) {
-      await ctx.db.patch(existing._id, definedFields)
+      await ctx.db.patch(existing._id, fieldsToUpdate)
     } else {
-      await ctx.db.insert("config", definedFields)
+      await ctx.db.insert("config", fieldsToUpdate)
     }
+  }
 
-    return null
-  },
-})
+  const merged = existing ? { ...existing, ...fieldsToUpdate } : fieldsToUpdate
+  return applyConfigDefaults(merged)
+}
 
 export const updatePointerVesting = internalMutation({
   args: {
@@ -151,25 +159,7 @@ export const enqueue = mutation({
   },
   returns: v.id("queueItems"),
   handler: async (ctx, args) => {
-    if (args.config) {
-      const definedFields: Partial<Config> = {}
-      for (const [key, value] of Object.entries(args.config)) {
-        if (value !== undefined) {
-          definedFields[key as keyof Config] = value
-        }
-      }
-
-      if (Object.keys(definedFields).length > 0) {
-        const existing = await ctx.db.query("config").first()
-        if (existing) {
-          await ctx.db.patch(existing._id, definedFields)
-        } else {
-          await ctx.db.insert("config", definedFields)
-        }
-      }
-    }
-
-    const config = await resolveConfig(ctx)
+    const config = await resolveAndMaybeUpdateConfig(ctx, args.config)
     const now = Date.now()
     const vestingTime = now + (args.delayMs ?? 0)
 
@@ -223,25 +213,7 @@ export const enqueueBatch = mutation({
   },
   returns: v.array(v.id("queueItems")),
   handler: async (ctx, args) => {
-    if (args.config) {
-      const definedFields: Partial<Config> = {}
-      for (const [key, value] of Object.entries(args.config)) {
-        if (value !== undefined) {
-          definedFields[key as keyof Config] = value
-        }
-      }
-
-      if (Object.keys(definedFields).length > 0) {
-        const existing = await ctx.db.query("config").first()
-        if (existing) {
-          await ctx.db.patch(existing._id, definedFields)
-        } else {
-          await ctx.db.insert("config", definedFields)
-        }
-      }
-    }
-
-    const config = await resolveConfig(ctx)
+    const config = await resolveAndMaybeUpdateConfig(ctx, args.config)
     const now = Date.now()
     const itemIds: Array<typeof schema.tables.queueItems.validator.type & { _id: string }> = []
     const pointerUpdates = new Map<
@@ -350,6 +322,57 @@ export const obtainPointerLease = internalMutation({
   },
 })
 
+type QueueOrder = "priority" | "fifo"
+
+async function collectAvailableItems(
+  db: QueryCtx["db"],
+  args: {
+    queueId: string
+    limit: number
+    orderBy: QueueOrder
+    now: number
+  }
+): Promise<Array<typeof queueItemValidator.type>> {
+  const query =
+    args.orderBy === "fifo"
+      ? db
+          .query("queueItems")
+          .withIndex("by_queue_fifo", (q) => q.eq("queueId", args.queueId))
+      : db
+          .query("queueItems")
+          .withIndex("by_queue_priority_vesting", (q) =>
+            q.eq("queueId", args.queueId)
+          )
+
+  const availableItems: Array<typeof queueItemValidator.type> = []
+  const maxScan = 1000
+  let scanned = 0
+
+  for await (const item of query) {
+    scanned++
+
+    if (scanned > maxScan) {
+      break
+    }
+
+    if (item.vestingTime > args.now) {
+      continue
+    }
+
+    if (item.leaseExpiry && item.leaseExpiry > args.now) {
+      continue
+    }
+
+    availableItems.push(item)
+
+    if (availableItems.length >= args.limit) {
+      break
+    }
+  }
+
+  return availableItems
+}
+
 export const peekItems = internalQuery({
   args: {
     queueId: v.string(),
@@ -359,24 +382,15 @@ export const peekItems = internalQuery({
   returns: v.array(queueItemValidator),
   handler: async (ctx, args) => {
     const now = Date.now()
-    const limit = args.limit ?? 10
-    const orderBy = args.orderBy ?? "priority"
+    const limit = args.limit ?? 100
+    const orderBy = (args.orderBy ?? "priority") as QueueOrder
 
-    const indexName =
-      orderBy === "fifo" ? "by_queue_fifo" : "by_queue_priority_vesting"
-
-    const items = await ctx.db
-      .query("queueItems")
-      .withIndex(indexName, (q) => q.eq("queueId", args.queueId))
-      .take(limit * 2)
-
-    return items
-      .filter((item) => {
-        if (item.vestingTime > now) return false
-        if (item.leaseExpiry && item.leaseExpiry > now) return false
-        return true
-      })
-      .slice(0, limit)
+    return await collectAvailableItems(ctx.db, {
+      queueId: args.queueId,
+      limit,
+      orderBy,
+      now,
+    })
   },
 })
 
@@ -412,6 +426,37 @@ export const obtainItemLease = internalMutation({
   },
 })
 
+export const extendItemLease = internalMutation({
+  args: {
+    itemId: v.id("queueItems"),
+    leaseId: v.string(),
+    leaseDurationMs: v.optional(v.number()),
+  },
+  returns: v.boolean(),
+  handler: async (ctx, args) => {
+    const now = Date.now()
+    const item = await ctx.db.get(args.itemId)
+
+    if (!item) {
+      return false
+    }
+
+    if (item.leaseId !== args.leaseId) {
+      return false
+    }
+
+    const config = await resolveConfig(ctx)
+    const leaseExpiry = now + (args.leaseDurationMs ?? config.defaultLeaseDurationMs)
+
+    await ctx.db.patch(args.itemId, {
+      leaseExpiry,
+      vestingTime: leaseExpiry,
+    })
+
+    return true
+  },
+})
+
 export const dequeue = internalMutation({
   args: {
     queueId: v.string(),
@@ -430,20 +475,13 @@ export const dequeue = internalMutation({
     const now = Date.now()
     const limit = args.limit ?? 10
     const leaseDurationMs = args.leaseDurationMs ?? config.defaultLeaseDurationMs
-    const orderBy = args.orderBy ?? "priority"
+    const orderBy = (args.orderBy ?? "priority") as QueueOrder
 
-    const indexName =
-      orderBy === "fifo" ? "by_queue_fifo" : "by_queue_priority_vesting"
-
-    const items = await ctx.db
-      .query("queueItems")
-      .withIndex(indexName, (q) => q.eq("queueId", args.queueId))
-      .take(limit * 2)
-
-    const availableItems = items.filter((item) => {
-      if (item.vestingTime > now) return false
-      if (item.leaseExpiry && item.leaseExpiry > now) return false
-      return true
+    const availableItems = await collectAvailableItems(ctx.db, {
+      queueId: args.queueId,
+      limit,
+      orderBy,
+      now,
     })
 
     const result: Array<{

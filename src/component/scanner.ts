@@ -164,7 +164,12 @@ export const runScanner = internalAction({
         })
     )
 
-    await Promise.all(managerPromises)
+    const results = await Promise.allSettled(managerPromises)
+    const failures = results.filter((result) => result.status === "rejected")
+
+    if (failures.length > 0) {
+      console.error("Scanner manager failures", failures.length)
+    }
 
     await ctx.runMutation(internal.scanner.rescheduleScanner, {
       leaseId: args.leaseId,
@@ -280,29 +285,18 @@ export const finalizePointer = internalMutation({
       return null
     }
 
-    const nextItem = await ctx.db
+    const hasItems = await ctx.db
       .query("queueItems")
-      .withIndex("by_queue_priority_vesting", (q) =>
+      .withIndex("by_queue_fifo", (q) =>
         q.eq("queueId", pointer.queueId)
       )
       .first()
 
-    if (!nextItem) {
-      await ctx.db.patch(args.pointerId, {
-        leaseId: undefined,
-        leaseExpiry: undefined,
-        vestingTime: now,
-      })
-      return null
-    }
-
-    const nextVestingTime = Math.max(nextItem.vestingTime, now)
-
     await ctx.db.patch(args.pointerId, {
       leaseId: undefined,
       leaseExpiry: undefined,
-      vestingTime: nextVestingTime,
-      lastActiveTime: now,
+      vestingTime: now,
+      lastActiveTime: hasItems ? now : pointer.lastActiveTime,
     })
 
     return null
@@ -318,6 +312,49 @@ export const runWorker = internalAction({
     queueId: v.string(),
   },
   handler: async (ctx, args) => {
+    const config = await ctx.runQuery(internal.lib.getResolvedConfig, {})
+    const extendIntervalMs = Math.max(
+      100,
+      Math.floor(config.defaultLeaseDurationMs / 2)
+    )
+
+    const sleep = (ms: number) =>
+      new Promise<void>((resolve) => {
+        setTimeout(resolve, ms)
+      })
+
+    let stop = false
+    let leaseValid = true
+    let stopResolve: (() => void) | undefined
+    const stopSignal = new Promise<void>((resolve) => {
+      stopResolve = resolve
+    })
+
+    const extendLeaseLoop = async () => {
+      while (true) {
+        await Promise.race([sleep(extendIntervalMs), stopSignal])
+
+        if (stop) {
+          return
+        }
+
+        const extended = await ctx.runMutation(internal.lib.extendItemLease, {
+          itemId: args.itemId,
+          leaseId: args.leaseId,
+        })
+
+        if (!extended) {
+          leaseValid = false
+          stop = true
+          stopResolve?.()
+          return
+        }
+      }
+    }
+
+    const extendPromise = extendLeaseLoop()
+    let handlerError: unknown | null = null
+
     try {
       const fnHandle = args.handler as FunctionHandle<
         "action",
@@ -327,21 +364,34 @@ export const runWorker = internalAction({
         payload: args.payload,
         queueId: args.queueId,
       })
+    } catch (error) {
+      handlerError = error
+    }
 
+    stop = true
+    stopResolve?.()
+    await extendPromise
+
+    if (!leaseValid) {
+      return
+    }
+
+    if (handlerError === null) {
       await ctx.runMutation(internal.lib.complete, {
         itemId: args.itemId,
         leaseId: args.leaseId,
       })
-    } catch (error) {
-      const errorMessage =
-        error instanceof Error ? error.message : String(error)
-
-      await ctx.runMutation(internal.lib.requeue, {
-        itemId: args.itemId,
-        leaseId: args.leaseId,
-        error: errorMessage,
-      })
+      return
     }
+
+    const errorMessage =
+      handlerError instanceof Error ? handlerError.message : String(handlerError)
+
+    await ctx.runMutation(internal.lib.requeue, {
+      itemId: args.itemId,
+      leaseId: args.leaseId,
+      error: errorMessage,
+    })
   },
 })
 
