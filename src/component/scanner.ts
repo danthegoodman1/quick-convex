@@ -1,5 +1,5 @@
 import { v } from "convex/values"
-import { v4 as uuidv4 } from "uuid"
+import { v7 as uuid } from "uuid"
 import type { FunctionHandle } from "convex/server"
 import {
   internalAction,
@@ -27,7 +27,7 @@ export const tryWakeScanner = internalMutation({
         return false
       }
 
-      const leaseId = uuidv4()
+      const leaseId = uuid()
       await ctx.db.patch(state._id, {
         leaseId,
         leaseExpiry: now + SCANNER_LEASE_DURATION_MS,
@@ -47,7 +47,7 @@ export const tryWakeScanner = internalMutation({
       return true
     }
 
-    const leaseId = uuidv4()
+    const leaseId = uuid()
     const stateId = await ctx.db.insert("scannerState", {
       leaseId,
       leaseExpiry: now + SCANNER_LEASE_DURATION_MS,
@@ -116,7 +116,7 @@ export const claimScannerLease = internalMutation({
     }> = []
 
     for (const pointer of availablePointers.slice(0, MAX_CONCURRENT_MANAGERS)) {
-      const pointerLeaseId = uuidv4()
+      const pointerLeaseId = uuid()
       const pointerLeaseExpiry = now + SCANNER_LEASE_DURATION_MS
 
       await ctx.db.patch(pointer._id, {
@@ -194,7 +194,7 @@ export const rescheduleScanner = internalMutation({
       return null
     }
 
-    const newLeaseId = uuidv4()
+    const newLeaseId = uuid()
     const delayMs = args.hasWork ? SCANNER_BACKOFF_MIN_MS : SCANNER_BACKOFF_MAX_MS
 
     await ctx.db.patch(state._id, {
@@ -243,7 +243,6 @@ export const runManager = internalAction({
         item: {
           _id: Id<"queueItems">
           payload: unknown
-          itemType: string
           handler: string
         }
         leaseId: string
@@ -253,7 +252,6 @@ export const runManager = internalAction({
           leaseId: item.leaseId,
           handler: item.item.handler,
           payload: item.item.payload,
-          itemType: item.item.itemType,
           queueId: args.queueId,
         })
     )
@@ -322,18 +320,16 @@ export const runWorker = internalAction({
     leaseId: v.string(),
     handler: v.string(),
     payload: v.any(),
-    itemType: v.string(),
     queueId: v.string(),
   },
   handler: async (ctx, args) => {
     try {
       const fnHandle = args.handler as FunctionHandle<
         "action",
-        { payload: unknown; itemType: string; queueId: string }
+        { payload: unknown; queueId: string }
       >
       await ctx.runAction(fnHandle, {
         payload: args.payload,
-        itemType: args.itemType,
         queueId: args.queueId,
       })
 
@@ -383,7 +379,7 @@ export const watchdogRecoverScanner = internalMutation({
       return false
     }
 
-    const leaseId = uuidv4()
+    const leaseId = uuid()
     await ctx.db.patch(state._id, {
       leaseId,
       leaseExpiry: now + SCANNER_LEASE_DURATION_MS,

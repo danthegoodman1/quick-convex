@@ -5,7 +5,6 @@ export default defineSchema({
   queueItems: defineTable({
     queueId: v.string(),
     payload: v.any(),
-    itemType: v.string(),
     handler: v.string(),
     priority: v.number(),
     vestingTime: v.number(),
@@ -29,14 +28,11 @@ export default defineSchema({
   deadLetterItems: defineTable({
     queueId: v.string(),
     payload: v.any(),
-    itemType: v.string(),
     handler: v.string(),
     errorCount: v.number(),
     lastError: v.optional(v.string()),
     movedAt: v.number(),
-  })
-    .index("by_queue", ["queueId"])
-    .index("by_type", ["itemType"]),
+  }).index("by_queue", ["queueId"]),
 
   scannerState: defineTable({
     leaseId: v.optional(v.string()),

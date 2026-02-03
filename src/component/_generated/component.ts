@@ -30,7 +30,6 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
         {
           delayMs?: number;
           handler: string;
-          itemType: string;
           payload: any;
           priority?: number;
           queueId: string;
@@ -45,7 +44,6 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
           items: Array<{
             delayMs?: number;
             handler: string;
-            itemType: string;
             payload: any;
             priority?: number;
             queueId: string;
@@ -69,13 +67,12 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
       listDeadLetters: FunctionReference<
         "query",
         "internal",
-        { itemType?: string; limit?: number; queueId?: string },
+        { limit?: number; queueId?: string },
         Array<{
           _creationTime: number;
           _id: string;
           errorCount: number;
           handler: string;
-          itemType: string;
           lastError?: string;
           movedAt: number;
           payload: any;

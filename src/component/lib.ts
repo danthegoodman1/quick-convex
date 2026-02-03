@@ -1,5 +1,5 @@
 import { v } from "convex/values"
-import { v4 as uuidv4 } from "uuid"
+import { v7 as uuid } from "uuid"
 import {
   internalMutation,
   internalQuery,
@@ -24,11 +24,35 @@ const queuePointerValidator = schema.tables.queuePointers.validator.extend({
   _creationTime: v.number(),
 })
 
+export const updatePointerVesting = internalMutation({
+  args: {
+    queueId: v.string(),
+    vestingTime: v.number(),
+  },
+  returns: v.null(),
+  handler: async (ctx, args) => {
+    const now = Date.now()
+
+    const pointer = await ctx.db
+      .query("queuePointers")
+      .withIndex("by_queue", (q) => q.eq("queueId", args.queueId))
+      .unique()
+
+    if (pointer && args.vestingTime < pointer.vestingTime) {
+      await ctx.db.patch(pointer._id, {
+        vestingTime: args.vestingTime,
+        lastActiveTime: now,
+      })
+    }
+
+    return null
+  },
+})
+
 export const enqueue = mutation({
   args: {
     queueId: v.string(),
     payload: v.any(),
-    itemType: v.string(),
     handler: v.string(),
     priority: v.optional(v.number()),
     delayMs: v.optional(v.number()),
@@ -41,7 +65,6 @@ export const enqueue = mutation({
     const itemId = await ctx.db.insert("queueItems", {
       queueId: args.queueId,
       payload: args.payload,
-      itemType: args.itemType,
       handler: args.handler,
       priority: args.priority ?? DEFAULT_PRIORITY,
       vestingTime,
@@ -54,16 +77,10 @@ export const enqueue = mutation({
       .unique()
 
     if (existingPointer) {
-      if (vestingTime < existingPointer.vestingTime) {
-        await ctx.db.patch(existingPointer._id, {
-          vestingTime,
-          lastActiveTime: now,
-        })
-      } else {
-        await ctx.db.patch(existingPointer._id, {
-          lastActiveTime: now,
-        })
-      }
+      await ctx.scheduler.runAfter(0, internal.lib.updatePointerVesting, {
+        queueId: args.queueId,
+        vestingTime,
+      })
     } else {
       await ctx.db.insert("queuePointers", {
         queueId: args.queueId,
@@ -86,7 +103,6 @@ export const enqueueBatch = mutation({
       v.object({
         queueId: v.string(),
         payload: v.any(),
-        itemType: v.string(),
         handler: v.string(),
         priority: v.optional(v.number()),
         delayMs: v.optional(v.number()),
@@ -108,7 +124,6 @@ export const enqueueBatch = mutation({
       const itemId = await ctx.db.insert("queueItems", {
         queueId: item.queueId,
         payload: item.payload,
-        itemType: item.itemType,
         handler: item.handler,
         priority: item.priority ?? DEFAULT_PRIORITY,
         vestingTime,
@@ -130,13 +145,10 @@ export const enqueueBatch = mutation({
         .unique()
 
       if (existingPointer) {
-        if (update.vestingTime < existingPointer.vestingTime) {
-          await ctx.db.patch(existingPointer._id, update)
-        } else {
-          await ctx.db.patch(existingPointer._id, {
-            lastActiveTime: update.lastActiveTime,
-          })
-        }
+        await ctx.scheduler.runAfter(0, internal.lib.updatePointerVesting, {
+          queueId,
+          vestingTime: update.vestingTime,
+        })
       } else {
         await ctx.db.insert("queuePointers", {
           queueId,
@@ -193,7 +205,7 @@ export const obtainPointerLease = internalMutation({
       return null
     }
 
-    const leaseId = uuidv4()
+    const leaseId = uuid()
     const leaseExpiry = now + (args.leaseDurationMs ?? DEFAULT_LEASE_DURATION_MS)
 
     await ctx.db.patch(args.pointerId, {
@@ -254,7 +266,7 @@ export const obtainItemLease = internalMutation({
       return null
     }
 
-    const leaseId = uuidv4()
+    const leaseId = uuid()
     const leaseExpiry = now + (args.leaseDurationMs ?? DEFAULT_LEASE_DURATION_MS)
 
     await ctx.db.patch(args.itemId, {
@@ -306,7 +318,7 @@ export const dequeue = internalMutation({
     }> = []
 
     for (const item of availableItems.slice(0, limit)) {
-      const leaseId = uuidv4()
+      const leaseId = uuid()
       const leaseExpiry = now + leaseDurationMs
 
       await ctx.db.patch(item._id, {
@@ -395,7 +407,6 @@ export const requeue = internalMutation({
       await ctx.db.insert("deadLetterItems", {
         queueId: item.queueId,
         payload: item.payload,
-        itemType: item.itemType,
         handler: item.handler,
         errorCount: newErrorCount,
         lastError: args.error,
@@ -549,7 +560,6 @@ export const getQueueStats = query({
 export const listDeadLetters = query({
   args: {
     queueId: v.optional(v.string()),
-    itemType: v.optional(v.string()),
     limit: v.optional(v.number()),
   },
   returns: v.array(
@@ -560,20 +570,12 @@ export const listDeadLetters = query({
   ),
   handler: async (ctx, args) => {
     const limit = args.limit ?? 100
-
-    const { queueId, itemType } = args
+    const { queueId } = args
 
     if (queueId) {
       return await ctx.db
         .query("deadLetterItems")
         .withIndex("by_queue", (q) => q.eq("queueId", queueId))
-        .take(limit)
-    }
-
-    if (itemType) {
-      return await ctx.db
-        .query("deadLetterItems")
-        .withIndex("by_type", (q) => q.eq("itemType", itemType))
         .take(limit)
     }
 
@@ -601,7 +603,6 @@ export const replayDeadLetter = mutation({
     const itemId = await ctx.db.insert("queueItems", {
       queueId: deadLetter.queueId,
       payload: deadLetter.payload,
-      itemType: deadLetter.itemType,
       handler: deadLetter.handler,
       priority: args.priority ?? DEFAULT_PRIORITY,
       vestingTime,
