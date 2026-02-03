@@ -5,6 +5,7 @@ import {
   internalQuery,
   mutation,
   query,
+  type QueryCtx,
 } from "./_generated/server.js"
 import { internal } from "./_generated/api.js"
 import schema from "./schema.js"
@@ -22,6 +23,96 @@ const queueItemValidator = schema.tables.queueItems.validator.extend({
 const queuePointerValidator = schema.tables.queuePointers.validator.extend({
   _id: v.id("queuePointers"),
   _creationTime: v.number(),
+})
+
+export const configValidator = schema.tables.config.validator
+
+export type Config = typeof configValidator.type
+
+export type ResolvedConfig = {
+  scannerLeaseDurationMs: number
+  scannerBackoffMinMs: number
+  scannerBackoffMaxMs: number
+  pointerBatchSize: number
+  maxConcurrentManagers: number
+  defaultPriority: number
+  defaultLeaseDurationMs: number
+  minInactiveBeforeDeleteMs: number
+  maxRetries: number
+}
+
+const CONFIG_DEFAULTS: ResolvedConfig = {
+  scannerLeaseDurationMs: 10_000,
+  scannerBackoffMinMs: 100,
+  scannerBackoffMaxMs: 5_000,
+  pointerBatchSize: 50,
+  maxConcurrentManagers: 10,
+  defaultPriority: DEFAULT_PRIORITY,
+  defaultLeaseDurationMs: DEFAULT_LEASE_DURATION_MS,
+  minInactiveBeforeDeleteMs: MIN_INACTIVE_BEFORE_DELETE_MS,
+  maxRetries: MAX_RETRIES,
+}
+
+export async function resolveConfig(ctx: QueryCtx): Promise<ResolvedConfig> {
+  const config = await ctx.db.query("config").first()
+  if (!config) {
+    return CONFIG_DEFAULTS
+  }
+  return {
+    scannerLeaseDurationMs: config.scannerLeaseDurationMs ?? CONFIG_DEFAULTS.scannerLeaseDurationMs,
+    scannerBackoffMinMs: config.scannerBackoffMinMs ?? CONFIG_DEFAULTS.scannerBackoffMinMs,
+    scannerBackoffMaxMs: config.scannerBackoffMaxMs ?? CONFIG_DEFAULTS.scannerBackoffMaxMs,
+    pointerBatchSize: config.pointerBatchSize ?? CONFIG_DEFAULTS.pointerBatchSize,
+    maxConcurrentManagers: config.maxConcurrentManagers ?? CONFIG_DEFAULTS.maxConcurrentManagers,
+    defaultPriority: config.defaultPriority ?? CONFIG_DEFAULTS.defaultPriority,
+    defaultLeaseDurationMs: config.defaultLeaseDurationMs ?? CONFIG_DEFAULTS.defaultLeaseDurationMs,
+    minInactiveBeforeDeleteMs: config.minInactiveBeforeDeleteMs ?? CONFIG_DEFAULTS.minInactiveBeforeDeleteMs,
+    maxRetries: config.maxRetries ?? CONFIG_DEFAULTS.maxRetries,
+  }
+}
+
+export const getConfig = internalQuery({
+  args: {},
+  returns: v.object({
+    scannerLeaseDurationMs: v.number(),
+    scannerBackoffMinMs: v.number(),
+    scannerBackoffMaxMs: v.number(),
+    pointerBatchSize: v.number(),
+    maxConcurrentManagers: v.number(),
+    defaultPriority: v.number(),
+    defaultLeaseDurationMs: v.number(),
+    minInactiveBeforeDeleteMs: v.number(),
+    maxRetries: v.number(),
+  }),
+  handler: async (ctx) => resolveConfig(ctx),
+})
+
+export const upsertConfig = internalMutation({
+  args: {
+    config: configValidator,
+  },
+  returns: v.null(),
+  handler: async (ctx, args) => {
+    const definedFields: Partial<Config> = {}
+    for (const [key, value] of Object.entries(args.config)) {
+      if (value !== undefined) {
+        definedFields[key as keyof Config] = value
+      }
+    }
+
+    if (Object.keys(definedFields).length === 0) {
+      return null
+    }
+
+    const existing = await ctx.db.query("config").first()
+    if (existing) {
+      await ctx.db.patch(existing._id, definedFields)
+    } else {
+      await ctx.db.insert("config", definedFields)
+    }
+
+    return null
+  },
 })
 
 export const updatePointerVesting = internalMutation({
@@ -56,9 +147,29 @@ export const enqueue = mutation({
     handler: v.string(),
     priority: v.optional(v.number()),
     delayMs: v.optional(v.number()),
+    config: v.optional(configValidator),
   },
   returns: v.id("queueItems"),
   handler: async (ctx, args) => {
+    if (args.config) {
+      const definedFields: Partial<Config> = {}
+      for (const [key, value] of Object.entries(args.config)) {
+        if (value !== undefined) {
+          definedFields[key as keyof Config] = value
+        }
+      }
+
+      if (Object.keys(definedFields).length > 0) {
+        const existing = await ctx.db.query("config").first()
+        if (existing) {
+          await ctx.db.patch(existing._id, definedFields)
+        } else {
+          await ctx.db.insert("config", definedFields)
+        }
+      }
+    }
+
+    const config = await resolveConfig(ctx)
     const now = Date.now()
     const vestingTime = now + (args.delayMs ?? 0)
 
@@ -66,7 +177,7 @@ export const enqueue = mutation({
       queueId: args.queueId,
       payload: args.payload,
       handler: args.handler,
-      priority: args.priority ?? DEFAULT_PRIORITY,
+      priority: args.priority ?? config.defaultPriority,
       vestingTime,
       errorCount: 0,
     })
@@ -108,9 +219,29 @@ export const enqueueBatch = mutation({
         delayMs: v.optional(v.number()),
       })
     ),
+    config: v.optional(configValidator),
   },
   returns: v.array(v.id("queueItems")),
   handler: async (ctx, args) => {
+    if (args.config) {
+      const definedFields: Partial<Config> = {}
+      for (const [key, value] of Object.entries(args.config)) {
+        if (value !== undefined) {
+          definedFields[key as keyof Config] = value
+        }
+      }
+
+      if (Object.keys(definedFields).length > 0) {
+        const existing = await ctx.db.query("config").first()
+        if (existing) {
+          await ctx.db.patch(existing._id, definedFields)
+        } else {
+          await ctx.db.insert("config", definedFields)
+        }
+      }
+    }
+
+    const config = await resolveConfig(ctx)
     const now = Date.now()
     const itemIds: Array<typeof schema.tables.queueItems.validator.type & { _id: string }> = []
     const pointerUpdates = new Map<
@@ -125,7 +256,7 @@ export const enqueueBatch = mutation({
         queueId: item.queueId,
         payload: item.payload,
         handler: item.handler,
-        priority: item.priority ?? DEFAULT_PRIORITY,
+        priority: item.priority ?? config.defaultPriority,
         vestingTime,
         errorCount: 0,
       })
@@ -205,8 +336,9 @@ export const obtainPointerLease = internalMutation({
       return null
     }
 
+    const config = await resolveConfig(ctx)
     const leaseId = uuid()
-    const leaseExpiry = now + (args.leaseDurationMs ?? DEFAULT_LEASE_DURATION_MS)
+    const leaseExpiry = now + (args.leaseDurationMs ?? config.defaultLeaseDurationMs)
 
     await ctx.db.patch(args.pointerId, {
       leaseId,
@@ -266,8 +398,9 @@ export const obtainItemLease = internalMutation({
       return null
     }
 
+    const config = await resolveConfig(ctx)
     const leaseId = uuid()
-    const leaseExpiry = now + (args.leaseDurationMs ?? DEFAULT_LEASE_DURATION_MS)
+    const leaseExpiry = now + (args.leaseDurationMs ?? config.defaultLeaseDurationMs)
 
     await ctx.db.patch(args.itemId, {
       leaseId,
@@ -293,9 +426,10 @@ export const dequeue = internalMutation({
     })
   ),
   handler: async (ctx, args) => {
+    const config = await resolveConfig(ctx)
     const now = Date.now()
     const limit = args.limit ?? 10
-    const leaseDurationMs = args.leaseDurationMs ?? DEFAULT_LEASE_DURATION_MS
+    const leaseDurationMs = args.leaseDurationMs ?? config.defaultLeaseDurationMs
     const orderBy = args.orderBy ?? "priority"
 
     const indexName =
@@ -390,6 +524,7 @@ export const requeue = internalMutation({
   },
   returns: v.boolean(),
   handler: async (ctx, args) => {
+    const config = await resolveConfig(ctx)
     const now = Date.now()
     const item = await ctx.db.get(args.itemId)
 
@@ -403,7 +538,7 @@ export const requeue = internalMutation({
 
     const newErrorCount = item.errorCount + 1
 
-    if (newErrorCount > MAX_RETRIES) {
+    if (newErrorCount > config.maxRetries) {
       await ctx.db.insert("deadLetterItems", {
         queueId: item.queueId,
         payload: item.payload,
@@ -478,8 +613,9 @@ export const garbageCollectPointers = internalMutation({
   },
   returns: v.number(),
   handler: async (ctx, args) => {
+    const config = await resolveConfig(ctx)
     const now = Date.now()
-    const limit = args.limit ?? 100
+    const limit = args.limit ?? 1000
 
     const pointers = await ctx.db
       .query("queuePointers")
@@ -493,7 +629,7 @@ export const garbageCollectPointers = internalMutation({
         continue
       }
 
-      if (now - pointer.lastActiveTime < MIN_INACTIVE_BEFORE_DELETE_MS) {
+      if (now - pointer.lastActiveTime < config.minInactiveBeforeDeleteMs) {
         continue
       }
 
@@ -591,6 +727,7 @@ export const replayDeadLetter = mutation({
   },
   returns: v.union(v.null(), v.id("queueItems")),
   handler: async (ctx, args) => {
+    const config = await resolveConfig(ctx)
     const deadLetter = await ctx.db.get(args.deadLetterId)
 
     if (!deadLetter) {
@@ -604,7 +741,7 @@ export const replayDeadLetter = mutation({
       queueId: deadLetter.queueId,
       payload: deadLetter.payload,
       handler: deadLetter.handler,
-      priority: args.priority ?? DEFAULT_PRIORITY,
+      priority: args.priority ?? config.defaultPriority,
       vestingTime,
       errorCount: 0,
     })

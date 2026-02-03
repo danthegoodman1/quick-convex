@@ -7,7 +7,7 @@ crons.interval(
   "garbage collect empty queue pointers",
   { minutes: 1 },
   internal.lib.garbageCollectPointers,
-  { limit: 100 }
+  {}
 )
 
 crons.interval(

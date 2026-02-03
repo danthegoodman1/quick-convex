@@ -40,4 +40,16 @@ export default defineSchema({
     lastRunAt: v.number(),
     scheduledFunctionId: v.optional(v.string()),
   }),
+
+  config: defineTable({
+    scannerLeaseDurationMs: v.optional(v.number()),
+    scannerBackoffMinMs: v.optional(v.number()),
+    scannerBackoffMaxMs: v.optional(v.number()),
+    pointerBatchSize: v.optional(v.number()),
+    maxConcurrentManagers: v.optional(v.number()),
+    defaultPriority: v.optional(v.number()),
+    defaultLeaseDurationMs: v.optional(v.number()),
+    minInactiveBeforeDeleteMs: v.optional(v.number()),
+    maxRetries: v.optional(v.number()),
+  }),
 })

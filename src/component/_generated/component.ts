@@ -28,6 +28,17 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
         "mutation",
         "internal",
         {
+          config?: {
+            defaultLeaseDurationMs?: number;
+            defaultPriority?: number;
+            maxConcurrentManagers?: number;
+            maxRetries?: number;
+            minInactiveBeforeDeleteMs?: number;
+            pointerBatchSize?: number;
+            scannerBackoffMaxMs?: number;
+            scannerBackoffMinMs?: number;
+            scannerLeaseDurationMs?: number;
+          };
           delayMs?: number;
           handler: string;
           payload: any;
@@ -41,6 +52,17 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
         "mutation",
         "internal",
         {
+          config?: {
+            defaultLeaseDurationMs?: number;
+            defaultPriority?: number;
+            maxConcurrentManagers?: number;
+            maxRetries?: number;
+            minInactiveBeforeDeleteMs?: number;
+            pointerBatchSize?: number;
+            scannerBackoffMaxMs?: number;
+            scannerBackoffMinMs?: number;
+            scannerLeaseDurationMs?: number;
+          };
           items: Array<{
             delayMs?: number;
             handler: string;

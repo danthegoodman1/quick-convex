@@ -8,12 +8,7 @@ import {
 } from "./_generated/server.js"
 import { internal } from "./_generated/api.js"
 import type { Id } from "./_generated/dataModel.js"
-
-const SCANNER_LEASE_DURATION_MS = 10_000
-const SCANNER_BACKOFF_MIN_MS = 100
-const SCANNER_BACKOFF_MAX_MS = 5_000
-const POINTER_BATCH_SIZE = 50
-const MAX_CONCURRENT_MANAGERS = 10
+import { resolveConfig } from "./lib.js"
 
 async function wakeScanner(
   ctx: MutationCtx,
@@ -24,6 +19,7 @@ async function wakeScanner(
     checkForWork?: boolean
   } = {}
 ): Promise<boolean> {
+  const config = await resolveConfig(ctx)
   const now = Date.now()
   const state = await ctx.db.query("scannerState").first()
 
@@ -32,7 +28,6 @@ async function wakeScanner(
   }
 
   if (opts.checkForWork) {
-    // we are checking for we are recovering
     const hasWork = await ctx.db
       .query("queuePointers")
       .withIndex("by_vesting", (q) => q.lte("vestingTime", now))
@@ -43,7 +38,7 @@ async function wakeScanner(
   }
 
   const leaseId = uuid()
-  const leaseExpiry = now + SCANNER_LEASE_DURATION_MS
+  const leaseExpiry = now + config.scannerLeaseDurationMs
 
   const stateId = state
     ? (await ctx.db.patch(state._id, { leaseId, leaseExpiry, lastRunAt: now }), state._id)
@@ -81,6 +76,7 @@ export const claimScannerLease = internalMutation({
     ),
   }),
   handler: async (ctx, args) => {
+    const config = await resolveConfig(ctx)
     const now = Date.now()
 
     const state = await ctx.db.query("scannerState").first()
@@ -94,14 +90,14 @@ export const claimScannerLease = internalMutation({
     }
 
     await ctx.db.patch(state._id, {
-      leaseExpiry: now + SCANNER_LEASE_DURATION_MS,
+      leaseExpiry: now + config.scannerLeaseDurationMs,
       lastRunAt: now,
     })
 
     const pointers = await ctx.db
       .query("queuePointers")
       .withIndex("by_vesting", (q) => q.lte("vestingTime", now))
-      .take(POINTER_BATCH_SIZE)
+      .take(config.pointerBatchSize)
 
     const availablePointers = pointers.filter(
       (p) => !p.leaseExpiry || p.leaseExpiry <= now
@@ -113,9 +109,9 @@ export const claimScannerLease = internalMutation({
       pointerLeaseId: string
     }> = []
 
-    for (const pointer of availablePointers.slice(0, MAX_CONCURRENT_MANAGERS)) {
+    for (const pointer of availablePointers.slice(0, config.maxConcurrentManagers)) {
       const pointerLeaseId = uuid()
-      const pointerLeaseExpiry = now + SCANNER_LEASE_DURATION_MS
+      const pointerLeaseExpiry = now + config.scannerLeaseDurationMs
 
       await ctx.db.patch(pointer._id, {
         leaseId: pointerLeaseId,
@@ -184,6 +180,7 @@ export const rescheduleScanner = internalMutation({
   },
   returns: v.null(),
   handler: async (ctx, args) => {
+    const config = await resolveConfig(ctx)
     const now = Date.now()
 
     const state = await ctx.db.query("scannerState").first()
@@ -193,11 +190,11 @@ export const rescheduleScanner = internalMutation({
     }
 
     const newLeaseId = uuid()
-    const delayMs = args.hasWork ? SCANNER_BACKOFF_MIN_MS : SCANNER_BACKOFF_MAX_MS
+    const delayMs = args.hasWork ? config.scannerBackoffMinMs : config.scannerBackoffMaxMs
 
     await ctx.db.patch(state._id, {
       leaseId: newLeaseId,
-      leaseExpiry: now + SCANNER_LEASE_DURATION_MS,
+      leaseExpiry: now + config.scannerLeaseDurationMs,
       lastRunAt: now,
     })
 
