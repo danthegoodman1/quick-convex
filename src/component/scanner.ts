@@ -4,6 +4,7 @@ import type { FunctionHandle } from "convex/server"
 import {
   internalAction,
   internalMutation,
+  type MutationCtx,
 } from "./_generated/server.js"
 import { internal } from "./_generated/api.js"
 import type { Id } from "./_generated/dataModel.js"
@@ -14,58 +15,54 @@ const SCANNER_BACKOFF_MAX_MS = 5_000
 const POINTER_BATCH_SIZE = 50
 const MAX_CONCURRENT_MANAGERS = 10
 
+async function wakeScanner(
+  ctx: MutationCtx,
+  opts: {
+    /**
+     * Whether to check for work before waking the scanner, used during recovery
+     */
+    checkForWork?: boolean
+  } = {}
+): Promise<boolean> {
+  const now = Date.now()
+  const state = await ctx.db.query("scannerState").first()
+
+  if (state && state.leaseExpiry && state.leaseExpiry > now) {
+    return false
+  }
+
+  if (opts.checkForWork) {
+    const hasWork = await ctx.db
+      .query("queuePointers")
+      .withIndex("by_vesting", (q) => q.lte("vestingTime", now))
+      .first()
+    if (!hasWork) {
+      return false
+    }
+  }
+
+  const leaseId = uuid()
+  const leaseExpiry = now + SCANNER_LEASE_DURATION_MS
+
+  const stateId = state
+    ? (await ctx.db.patch(state._id, { leaseId, leaseExpiry, lastRunAt: now }), state._id)
+    : await ctx.db.insert("scannerState", { leaseId, leaseExpiry, lastRunAt: now })
+
+  const scheduledId = await ctx.scheduler.runAfter(
+    0,
+    internal.scanner.runScanner,
+    { leaseId }
+  )
+
+  await ctx.db.patch(stateId, { scheduledFunctionId: scheduledId })
+
+  return true
+}
+
 export const tryWakeScanner = internalMutation({
   args: {},
   returns: v.boolean(),
-  handler: async (ctx) => {
-    const now = Date.now()
-
-    const state = await ctx.db.query("scannerState").first()
-
-    if (state) {
-      if (state.leaseExpiry && state.leaseExpiry > now) {
-        return false
-      }
-
-      const leaseId = uuid()
-      await ctx.db.patch(state._id, {
-        leaseId,
-        leaseExpiry: now + SCANNER_LEASE_DURATION_MS,
-        lastRunAt: now,
-      })
-
-      const scheduledId = await ctx.scheduler.runAfter(
-        0,
-        internal.scanner.runScanner,
-        { leaseId }
-      )
-
-      await ctx.db.patch(state._id, {
-        scheduledFunctionId: scheduledId,
-      })
-
-      return true
-    }
-
-    const leaseId = uuid()
-    const stateId = await ctx.db.insert("scannerState", {
-      leaseId,
-      leaseExpiry: now + SCANNER_LEASE_DURATION_MS,
-      lastRunAt: now,
-    })
-
-    const scheduledId = await ctx.scheduler.runAfter(
-      0,
-      internal.scanner.runScanner,
-      { leaseId }
-    )
-
-    await ctx.db.patch(stateId, {
-      scheduledFunctionId: scheduledId,
-    })
-
-    return true
-  },
+  handler: async (ctx) => wakeScanner(ctx), // We don't want to wake the scanner because this is only called after work is enqueued
 })
 
 export const claimScannerLease = internalMutation({
@@ -353,49 +350,5 @@ export const runWorker = internalAction({
 export const watchdogRecoverScanner = internalMutation({
   args: {},
   returns: v.boolean(),
-  handler: async (ctx): Promise<boolean> => {
-    const now = Date.now()
-
-    const state = await ctx.db.query("scannerState").first()
-
-    if (!state) {
-      const woke: boolean = await ctx.runMutation(
-        internal.scanner.tryWakeScanner,
-        {}
-      )
-      return woke
-    }
-
-    if (state.leaseExpiry && state.leaseExpiry > now) {
-      return false
-    }
-
-    const hasWork = await ctx.db
-      .query("queuePointers")
-      .withIndex("by_vesting", (q) => q.lte("vestingTime", now))
-      .first()
-
-    if (!hasWork) {
-      return false
-    }
-
-    const leaseId = uuid()
-    await ctx.db.patch(state._id, {
-      leaseId,
-      leaseExpiry: now + SCANNER_LEASE_DURATION_MS,
-      lastRunAt: now,
-    })
-
-    const scheduledId = await ctx.scheduler.runAfter(
-      0,
-      internal.scanner.runScanner,
-      { leaseId }
-    )
-
-    await ctx.db.patch(state._id, {
-      scheduledFunctionId: scheduledId,
-    })
-
-    return true
-  },
+  handler: async (ctx) => wakeScanner(ctx, { checkForWork: true }),
 })
