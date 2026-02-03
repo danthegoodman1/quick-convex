@@ -8,7 +8,6 @@ import {
 import { internal } from "./_generated/api.js"
 import type { Id } from "./_generated/dataModel.js"
 
-const DEFAULT_PARTITION = "default"
 const SCANNER_LEASE_DURATION_MS = 10_000
 const SCANNER_BACKOFF_MIN_MS = 100
 const SCANNER_BACKOFF_MAX_MS = 5_000
@@ -16,18 +15,12 @@ const POINTER_BATCH_SIZE = 50
 const MAX_CONCURRENT_MANAGERS = 10
 
 export const tryWakeScanner = internalMutation({
-  args: {
-    partition: v.optional(v.string()),
-  },
+  args: {},
   returns: v.boolean(),
-  handler: async (ctx, args) => {
-    const partition = args.partition ?? DEFAULT_PARTITION
+  handler: async (ctx) => {
     const now = Date.now()
 
-    const state = await ctx.db
-      .query("scannerState")
-      .withIndex("by_partition", (q) => q.eq("partition", partition))
-      .unique()
+    const state = await ctx.db.query("scannerState").first()
 
     if (state) {
       if (state.leaseExpiry && state.leaseExpiry > now) {
@@ -44,7 +37,7 @@ export const tryWakeScanner = internalMutation({
       const scheduledId = await ctx.scheduler.runAfter(
         0,
         internal.scanner.runScanner,
-        { partition, leaseId }
+        { leaseId }
       )
 
       await ctx.db.patch(state._id, {
@@ -56,7 +49,6 @@ export const tryWakeScanner = internalMutation({
 
     const leaseId = uuidv4()
     const stateId = await ctx.db.insert("scannerState", {
-      partition,
       leaseId,
       leaseExpiry: now + SCANNER_LEASE_DURATION_MS,
       lastRunAt: now,
@@ -65,7 +57,7 @@ export const tryWakeScanner = internalMutation({
     const scheduledId = await ctx.scheduler.runAfter(
       0,
       internal.scanner.runScanner,
-      { partition, leaseId }
+      { leaseId }
     )
 
     await ctx.db.patch(stateId, {
@@ -78,7 +70,6 @@ export const tryWakeScanner = internalMutation({
 
 export const claimScannerLease = internalMutation({
   args: {
-    partition: v.string(),
     leaseId: v.string(),
   },
   returns: v.object({
@@ -94,10 +85,7 @@ export const claimScannerLease = internalMutation({
   handler: async (ctx, args) => {
     const now = Date.now()
 
-    const state = await ctx.db
-      .query("scannerState")
-      .withIndex("by_partition", (q) => q.eq("partition", args.partition))
-      .unique()
+    const state = await ctx.db.query("scannerState").first()
 
     if (!state || state.leaseId !== args.leaseId) {
       return { valid: false, pointers: [] }
@@ -150,12 +138,10 @@ export const claimScannerLease = internalMutation({
 
 export const runScanner = internalAction({
   args: {
-    partition: v.string(),
     leaseId: v.string(),
   },
   handler: async (ctx, args) => {
     const result = await ctx.runMutation(internal.scanner.claimScannerLease, {
-      partition: args.partition,
       leaseId: args.leaseId,
     })
 
@@ -165,7 +151,6 @@ export const runScanner = internalAction({
 
     if (result.pointers.length === 0) {
       await ctx.runMutation(internal.scanner.rescheduleScanner, {
-        partition: args.partition,
         leaseId: args.leaseId,
         hasWork: false,
       })
@@ -188,7 +173,6 @@ export const runScanner = internalAction({
     await Promise.all(managerPromises)
 
     await ctx.runMutation(internal.scanner.rescheduleScanner, {
-      partition: args.partition,
       leaseId: args.leaseId,
       hasWork: true,
     })
@@ -197,7 +181,6 @@ export const runScanner = internalAction({
 
 export const rescheduleScanner = internalMutation({
   args: {
-    partition: v.string(),
     leaseId: v.string(),
     hasWork: v.boolean(),
   },
@@ -205,10 +188,7 @@ export const rescheduleScanner = internalMutation({
   handler: async (ctx, args) => {
     const now = Date.now()
 
-    const state = await ctx.db
-      .query("scannerState")
-      .withIndex("by_partition", (q) => q.eq("partition", args.partition))
-      .unique()
+    const state = await ctx.db.query("scannerState").first()
 
     if (!state || state.leaseId !== args.leaseId) {
       return null
@@ -226,7 +206,7 @@ export const rescheduleScanner = internalMutation({
     const scheduledId = await ctx.scheduler.runAfter(
       delayMs,
       internal.scanner.runScanner,
-      { partition: args.partition, leaseId: newLeaseId }
+      { leaseId: newLeaseId }
     )
 
     await ctx.db.patch(state._id, {
@@ -375,23 +355,17 @@ export const runWorker = internalAction({
 })
 
 export const watchdogRecoverScanner = internalMutation({
-  args: {
-    partition: v.optional(v.string()),
-  },
+  args: {},
   returns: v.boolean(),
-  handler: async (ctx, args): Promise<boolean> => {
-    const partition = args.partition ?? DEFAULT_PARTITION
+  handler: async (ctx): Promise<boolean> => {
     const now = Date.now()
 
-    const state = await ctx.db
-      .query("scannerState")
-      .withIndex("by_partition", (q) => q.eq("partition", partition))
-      .unique()
+    const state = await ctx.db.query("scannerState").first()
 
     if (!state) {
       const woke: boolean = await ctx.runMutation(
         internal.scanner.tryWakeScanner,
-        { partition }
+        {}
       )
       return woke
     }
@@ -419,7 +393,7 @@ export const watchdogRecoverScanner = internalMutation({
     const scheduledId = await ctx.scheduler.runAfter(
       0,
       internal.scanner.runScanner,
-      { partition, leaseId }
+      { leaseId }
     )
 
     await ctx.db.patch(state._id, {

@@ -39,10 +39,9 @@ export default defineSchema({
     .index("by_type", ["itemType"]),
 
   scannerState: defineTable({
-    partition: v.string(),
     leaseId: v.optional(v.string()),
     leaseExpiry: v.optional(v.number()),
     lastRunAt: v.number(),
     scheduledFunctionId: v.optional(v.string()),
-  }).index("by_partition", ["partition"]),
+  }),
 })
