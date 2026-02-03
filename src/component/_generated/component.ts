@@ -29,6 +29,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
         "internal",
         {
           delayMs?: number;
+          handler: string;
           itemType: string;
           payload: any;
           priority?: number;
@@ -43,6 +44,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
         {
           items: Array<{
             delayMs?: number;
+            handler: string;
             itemType: string;
             payload: any;
             priority?: number;
@@ -72,6 +74,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
           _creationTime: number;
           _id: string;
           errorCount: number;
+          handler: string;
           itemType: string;
           lastError?: string;
           movedAt: number;

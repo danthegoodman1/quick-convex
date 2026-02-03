@@ -1,11 +1,12 @@
 import { v } from "convex/values"
 import { v4 as uuidv4 } from "uuid"
+import type { FunctionHandle } from "convex/server"
 import {
   internalAction,
   internalMutation,
 } from "./_generated/server.js"
 import { internal } from "./_generated/api.js"
-import { Id } from "./_generated/dataModel.js"
+import type { Id } from "./_generated/dataModel.js"
 
 const DEFAULT_PARTITION = "default"
 const SCANNER_LEASE_DURATION_MS = 10_000
@@ -257,14 +258,24 @@ export const runManager = internalAction({
       return
     }
 
-    const workerPromises = items.map((item) =>
-      ctx.runAction(internal.scanner.runWorker, {
-        itemId: item.item._id,
-        leaseId: item.leaseId,
-        payload: item.item.payload,
-        itemType: item.item.itemType,
-        queueId: args.queueId,
-      })
+    const workerPromises = items.map(
+      (item: {
+        item: {
+          _id: Id<"queueItems">
+          payload: unknown
+          itemType: string
+          handler: string
+        }
+        leaseId: string
+      }) =>
+        ctx.runAction(internal.scanner.runWorker, {
+          itemId: item.item._id,
+          leaseId: item.leaseId,
+          handler: item.item.handler,
+          payload: item.item.payload,
+          itemType: item.item.itemType,
+          queueId: args.queueId,
+        })
     )
 
     await Promise.all(workerPromises)
@@ -329,14 +340,18 @@ export const runWorker = internalAction({
   args: {
     itemId: v.id("queueItems"),
     leaseId: v.string(),
+    handler: v.string(),
     payload: v.any(),
     itemType: v.string(),
     queueId: v.string(),
   },
   handler: async (ctx, args) => {
     try {
-      await ctx.runAction(internal.handlers.processItem, {
-        itemId: args.itemId,
+      const fnHandle = args.handler as FunctionHandle<
+        "action",
+        { payload: unknown; itemType: string; queueId: string }
+      >
+      await ctx.runAction(fnHandle, {
         payload: args.payload,
         itemType: args.itemType,
         queueId: args.queueId,
@@ -364,7 +379,7 @@ export const watchdogRecoverScanner = internalMutation({
     partition: v.optional(v.string()),
   },
   returns: v.boolean(),
-  handler: async (ctx, args) => {
+  handler: async (ctx, args): Promise<boolean> => {
     const partition = args.partition ?? DEFAULT_PARTITION
     const now = Date.now()
 
@@ -374,9 +389,11 @@ export const watchdogRecoverScanner = internalMutation({
       .unique()
 
     if (!state) {
-      return await ctx.runMutation(internal.scanner.tryWakeScanner, {
-        partition,
-      })
+      const woke: boolean = await ctx.runMutation(
+        internal.scanner.tryWakeScanner,
+        { partition }
+      )
+      return woke
     }
 
     if (state.leaseExpiry && state.leaseExpiry > now) {
