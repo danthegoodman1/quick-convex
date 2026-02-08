@@ -71,6 +71,7 @@ export const claimScannerLease = internalMutation({
     valid: v.boolean(),
     orderBy: v.union(v.literal("vesting"), v.literal("fifo")),
     hasDuePointers: v.boolean(),
+    nextPointerLeased: v.boolean(),
     nextPointerVestingTime: v.union(v.null(), v.number()),
     pointers: v.array(
       v.object({
@@ -91,6 +92,7 @@ export const claimScannerLease = internalMutation({
         valid: false,
         orderBy: config.defaultOrderBy,
         hasDuePointers: false,
+        nextPointerLeased: false,
         nextPointerVestingTime: null,
         pointers: [],
       }
@@ -101,6 +103,7 @@ export const claimScannerLease = internalMutation({
         valid: false,
         orderBy: config.defaultOrderBy,
         hasDuePointers: false,
+        nextPointerLeased: false,
         nextPointerVestingTime: null,
         pointers: [],
       }
@@ -179,6 +182,8 @@ export const claimScannerLease = internalMutation({
       valid: true,
       orderBy: config.defaultOrderBy,
       hasDuePointers,
+      nextPointerLeased:
+        nextPointer?.leaseExpiry !== undefined && nextPointer.leaseExpiry > now,
       nextPointerVestingTime: nextPointer?.vestingTime ?? null,
       pointers: claimedPointers,
     }
@@ -199,7 +204,7 @@ export const runScanner = internalAction({
     }
 
     if (result.pointers.length === 0) {
-      if (result.hasDuePointers) {
+      if (result.hasDuePointers || result.nextPointerLeased) {
         await ctx.runMutation(internal.scanner.rescheduleScanner, {
           leaseId: args.leaseId,
           hasWork: true,
@@ -391,9 +396,24 @@ export const finalizePointer = internalMutation({
             )
             .first()
 
-    const nextVestingTime = nextItem
-      ? Math.max(now, nextItem.vestingTime)
-      : now
+    let nextVestingTime = now
+    if (nextItem) {
+      if (
+        args.orderBy === "fifo" &&
+        nextItem.leaseExpiry !== undefined &&
+        nextItem.leaseExpiry > now
+      ) {
+        // FIFO head is currently leased. Recheck soon so completion can unblock
+        // following items without waiting for full lease expiry.
+        const config = await resolveConfig(ctx)
+        nextVestingTime = Math.min(
+          nextItem.leaseExpiry,
+          now + config.scannerBackoffMinMs
+        )
+      } else {
+        nextVestingTime = Math.max(now, nextItem.vestingTime)
+      }
+    }
 
     await ctx.db.patch(args.pointerId, {
       leaseId: undefined,
@@ -401,6 +421,10 @@ export const finalizePointer = internalMutation({
       vestingTime: nextVestingTime,
       lastActiveTime: nextItem ? now : pointer.lastActiveTime,
     })
+
+    if (nextVestingTime <= now) {
+      await ctx.scheduler.runAfter(0, internal.scanner.tryWakeScanner, {})
+    }
 
     return null
   },
