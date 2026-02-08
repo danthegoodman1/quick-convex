@@ -138,8 +138,7 @@ Quick is heavily inspired by Convex Workpools and the QuiCK paper. Workpools are
 
 - Multiple ordering modes, especially strict per-domain FIFO via `queueId`.
 - FIFO is much easier to model than emulating ordering via many `maxParallelism: 1` workpools.
-- Faster ramp from idle to heavy load in contention-prone bursts.
-- Lower contention during scale-up in those same bursty scenarios.
+- Faster and lower contention ramp from idle to heavy load.
 
 ### Tradeoff to keep in mind
 
