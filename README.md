@@ -137,7 +137,7 @@ Quick is heavily inspired by Convex Workpools and the QuiCK paper. Workpools are
 ### Quick strengths
 
 - Multiple ordering modes, especially strict per-domain FIFO via `queueId`.
-- FIFO is much easier to model than emulating ordering via many `maxParallelism: 1` pools.
+- FIFO is much easier to model than emulating ordering via many `maxParallelism: 1` workpools.
 - Faster ramp from idle to heavy load in contention-prone bursts.
 - Lower contention during scale-up in those same bursty scenarios.
 
