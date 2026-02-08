@@ -8,48 +8,105 @@ import {
 } from "convex/server";
 import { v } from "convex/values";
 import { describe, expect, test } from "vitest";
-import { api, internal } from "./_generated/api.js";
+import { internal } from "./_generated/api.js";
 import { action, mutation } from "./_generated/server.js";
 import { initConvexTest } from "./setup.test.js";
 
-export const workerAction = action({
+export const markProbeExecuted = mutation({
   args: {
-    payload: v.object({ value: v.number() }),
-    queueId: v.string(),
+    probeId: v.id("queueItems"),
+    via: v.union(v.literal("action"), v.literal("mutation")),
   },
   returns: v.null(),
-  handler: async () => null,
-});
-
-export const workerMutation = mutation({
-  args: {
-    payload: v.object({ value: v.number() }),
-    queueId: v.string(),
+  handler: async (ctx, args) => {
+    await ctx.db.patch(args.probeId, {
+      payload: { executedBy: args.via },
+    });
+    return null;
   },
-  returns: v.null(),
-  handler: async () => null,
 });
 
-const workerActionRef = makeFunctionReference<
-  "action",
-  { payload: { value: number }; queueId: string }
->("lib.test:workerAction");
-
-const workerMutationRef = makeFunctionReference<
+const markProbeExecutedRef = makeFunctionReference<
   "mutation",
-  { payload: { value: number }; queueId: string }
->("lib.test:workerMutation");
+  {
+    probeId: string;
+    via: "action" | "mutation";
+  }
+>("lib.test:markProbeExecuted");
+
+export const workerActionExec = action({
+  args: {
+    payload: v.object({ probeId: v.id("queueItems") }),
+    queueId: v.string(),
+  },
+  returns: v.null(),
+  handler: async (ctx, args) => {
+    await ctx.runMutation(markProbeExecutedRef, {
+      probeId: args.payload.probeId,
+      via: "action",
+    });
+    return null;
+  },
+});
+
+export const workerMutationExec = mutation({
+  args: {
+    payload: v.object({ probeId: v.id("queueItems") }),
+    queueId: v.string(),
+  },
+  returns: v.null(),
+  handler: async (ctx, args) => {
+    await ctx.runMutation(markProbeExecutedRef, {
+      probeId: args.payload.probeId,
+      via: "mutation",
+    });
+    return null;
+  },
+});
+
+export const workerAlwaysFailAction = action({
+  args: {
+    payload: v.any(),
+    queueId: v.string(),
+  },
+  returns: v.null(),
+  handler: async () => {
+    throw new Error("intentional failure");
+  },
+});
+
+const workerActionExecRef = makeFunctionReference<
+  "action",
+  { payload: { probeId: string }; queueId: string }
+>("lib.test:workerActionExec");
+
+const workerMutationExecRef = makeFunctionReference<
+  "mutation",
+  { payload: { probeId: string }; queueId: string }
+>("lib.test:workerMutationExec");
+
+const workerAlwaysFailActionRef = makeFunctionReference<
+  "action",
+  { payload: unknown; queueId: string }
+>("lib.test:workerAlwaysFailAction");
 
 export const createWorkerHandle = mutation({
   args: {
-    type: v.union(v.literal("action"), v.literal("mutation")),
+    type: v.union(
+      v.literal("actionExec"),
+      v.literal("mutationExec"),
+      v.literal("alwaysFailAction"),
+    ),
   },
   returns: v.string(),
   handler: async (_ctx, args) => {
-    if (args.type === "mutation") {
-      return await createFunctionHandle(workerMutationRef);
+    if (args.type === "actionExec") {
+      return await createFunctionHandle(workerActionExecRef);
     }
-    return await createFunctionHandle(workerActionRef);
+    if (args.type === "mutationExec") {
+      return await createFunctionHandle(workerMutationExecRef);
+    }
+    return await createFunctionHandle(workerAlwaysFailActionRef);
   },
 });
 
@@ -61,100 +118,219 @@ const testApi = (
   }>
 )["lib.test"];
 
-describe("component runtime", () => {
-  test("enqueue defaults handlerType to action for legacy callers", async () => {
+describe("component runtime execution", () => {
+  test("runWorker executes action handlers", async () => {
     const t = initConvexTest();
+    const probeId = await t.run(async (ctx) =>
+      ctx.db.insert("queueItems", {
+        queueId: "probe",
+        payload: { executedBy: null },
+        handler: "probe",
+        vestingTime: 0,
+        errorCount: 0,
+      }),
+    );
 
-    const itemId = await t.mutation(api.lib.enqueue, {
-      queueId: "queue-legacy",
-      payload: { value: 1 },
-      handler: "legacy-handler",
+    const handle = await t.mutation(testApi.createWorkerHandle, {
+      type: "actionExec",
     });
-
-    const row = await t.run(async (ctx) => await ctx.db.get(itemId));
-    expect(row).not.toBeNull();
-    expect(row?.handlerType).toBe("action");
-  });
-
-  test("runWorker dispatches action and completes item", async () => {
-    const t = initConvexTest();
-
-    const handle = await t.mutation(testApi.createWorkerHandle, { type: "action" });
-    const itemId = await t.run(async (ctx) => {
-      return await ctx.db.insert("queueItems", {
-        queueId: "queue-run-action",
-        payload: { value: 1 },
+    const itemId = await t.run(async (ctx) =>
+      ctx.db.insert("queueItems", {
+        queueId: "queue-action",
+        payload: { probeId },
         handler: handle,
         handlerType: "action",
         vestingTime: 0,
         leaseId: "lease-action",
         errorCount: 0,
-      });
-    });
+      }),
+    );
 
     await t.action(internal.scanner.runWorker, {
       itemId,
       leaseId: "lease-action",
       handler: handle,
       handlerType: "action",
-      payload: { value: 1 },
-      queueId: "queue-run-action",
+      payload: { probeId },
+      queueId: "queue-action",
     });
 
-    const row = await t.run(async (ctx) => await ctx.db.get(itemId));
-    expect(row).toBeNull();
+    const [probe, processed] = await t.run(async (ctx) => {
+      return Promise.all([ctx.db.get(probeId), ctx.db.get(itemId)]);
+    });
+    expect(probe?.payload).toEqual({ executedBy: "action" });
+    expect(processed).toBeNull();
   });
 
-  test("runWorker dispatches mutation and completes item", async () => {
+  test("runWorker executes mutation handlers", async () => {
     const t = initConvexTest();
+    const probeId = await t.run(async (ctx) =>
+      ctx.db.insert("queueItems", {
+        queueId: "probe",
+        payload: { executedBy: null },
+        handler: "probe",
+        vestingTime: 0,
+        errorCount: 0,
+      }),
+    );
 
     const handle = await t.mutation(testApi.createWorkerHandle, {
-      type: "mutation",
+      type: "mutationExec",
     });
-    const itemId = await t.run(async (ctx) => {
-      return await ctx.db.insert("queueItems", {
-        queueId: "queue-run-mutation",
-        payload: { value: 2 },
+    const itemId = await t.run(async (ctx) =>
+      ctx.db.insert("queueItems", {
+        queueId: "queue-mutation",
+        payload: { probeId },
         handler: handle,
         handlerType: "mutation",
         vestingTime: 0,
         leaseId: "lease-mutation",
         errorCount: 0,
-      });
-    });
+      }),
+    );
 
     await t.action(internal.scanner.runWorker, {
       itemId,
       leaseId: "lease-mutation",
       handler: handle,
       handlerType: "mutation",
-      payload: { value: 2 },
-      queueId: "queue-run-mutation",
+      payload: { probeId },
+      queueId: "queue-mutation",
     });
 
-    const row = await t.run(async (ctx) => await ctx.db.get(itemId));
-    expect(row).toBeNull();
+    const [probe, processed] = await t.run(async (ctx) => {
+      return Promise.all([ctx.db.get(probeId), ctx.db.get(itemId)]);
+    });
+    expect(probe?.payload).toEqual({ executedBy: "mutation" });
+    expect(processed).toBeNull();
   });
 
-  test("replayDeadLetter preserves handlerType", async () => {
+  test("vesting order allows later ready item after head fails and is delayed", async () => {
     const t = initConvexTest();
+    const queueId = "queue-vesting";
+    const probeId = await t.run(async (ctx) =>
+      ctx.db.insert("queueItems", {
+        queueId: "probe",
+        payload: { executedBy: null },
+        handler: "probe",
+        vestingTime: 0,
+        errorCount: 0,
+      }),
+    );
 
-    const deadLetterId = await t.run(async (ctx) => {
-      return await ctx.db.insert("deadLetterItems", {
-        queueId: "queue-dlq",
-        payload: { value: 1 },
-        handler: "mutation-handler",
-        handlerType: "mutation",
-        errorCount: 11,
-        movedAt: 1000,
+    const [failHandle, mutationHandle] = await Promise.all([
+      t.mutation(testApi.createWorkerHandle, { type: "alwaysFailAction" }),
+      t.mutation(testApi.createWorkerHandle, { type: "mutationExec" }),
+    ]);
+
+    const [firstId, secondId] = await t.run(async (ctx) => {
+      const a = await ctx.db.insert("queueItems", {
+        queueId,
+        payload: { tag: "first" },
+        handler: failHandle,
+        handlerType: "action",
+        vestingTime: 0,
+        errorCount: 0,
       });
+      const b = await ctx.db.insert("queueItems", {
+        queueId,
+        payload: { probeId },
+        handler: mutationHandle,
+        handlerType: "mutation",
+        vestingTime: 0,
+        errorCount: 0,
+      });
+      return [a, b];
     });
 
-    const itemId = await t.mutation(api.lib.replayDeadLetter, { deadLetterId });
-    expect(itemId).not.toBeNull();
+    const firstLease = await t.mutation(internal.lib.dequeue, {
+      queueId,
+      limit: 1,
+      orderBy: "vesting",
+    });
+    expect(firstLease).toHaveLength(1);
+    expect(firstLease[0].item._id).toBe(firstId);
 
-    const row = await t.run(async (ctx) => await ctx.db.get(itemId!));
-    expect(row).not.toBeNull();
-    expect(row?.handlerType).toBe("mutation");
+    await t.action(internal.scanner.runWorker, {
+      itemId: firstLease[0].item._id,
+      leaseId: firstLease[0].leaseId,
+      handler: firstLease[0].item.handler,
+      handlerType: "action",
+      payload: firstLease[0].item.payload,
+      queueId,
+    });
+
+    const secondLease = await t.mutation(internal.lib.dequeue, {
+      queueId,
+      limit: 1,
+      orderBy: "vesting",
+    });
+    expect(secondLease).toHaveLength(1);
+    expect(secondLease[0].item._id).toBe(secondId);
+
+    await t.action(internal.scanner.runWorker, {
+      itemId: secondLease[0].item._id,
+      leaseId: secondLease[0].leaseId,
+      handler: secondLease[0].item.handler,
+      handlerType: "mutation",
+      payload: secondLease[0].item.payload,
+      queueId,
+    });
+
+    const probe = await t.run(async (ctx) => ctx.db.get(probeId));
+    expect(probe?.payload).toEqual({ executedBy: "mutation" });
+  });
+
+  test("fifo order blocks later ready items behind delayed head", async () => {
+    const t = initConvexTest();
+    const queueId = "queue-fifo";
+
+    const failHandle = await t.mutation(testApi.createWorkerHandle, {
+      type: "alwaysFailAction",
+    });
+
+    const [firstId] = await t.run(async (ctx) => {
+      const a = await ctx.db.insert("queueItems", {
+        queueId,
+        payload: { tag: "first" },
+        handler: failHandle,
+        handlerType: "action",
+        vestingTime: 0,
+        errorCount: 0,
+      });
+      await ctx.db.insert("queueItems", {
+        queueId,
+        payload: { tag: "second" },
+        handler: failHandle,
+        handlerType: "action",
+        vestingTime: 0,
+        errorCount: 0,
+      });
+      return [a];
+    });
+
+    const firstLease = await t.mutation(internal.lib.dequeue, {
+      queueId,
+      limit: 1,
+      orderBy: "fifo",
+    });
+    expect(firstLease).toHaveLength(1);
+    expect(firstLease[0].item._id).toBe(firstId);
+
+    await t.action(internal.scanner.runWorker, {
+      itemId: firstLease[0].item._id,
+      leaseId: firstLease[0].leaseId,
+      handler: firstLease[0].item.handler,
+      handlerType: "action",
+      payload: firstLease[0].item.payload,
+      queueId,
+    });
+
+    const secondLease = await t.mutation(internal.lib.dequeue, {
+      queueId,
+      limit: 1,
+      orderBy: "fifo",
+    });
+    expect(secondLease).toHaveLength(0);
   });
 });
