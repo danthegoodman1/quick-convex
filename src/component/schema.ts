@@ -54,6 +54,7 @@ export default defineSchema({
     scannerBackoffMaxMs: v.optional(v.number()),
     pointerBatchSize: v.optional(v.number()),
     maxConcurrentManagers: v.optional(v.number()),
+    managerBatchSize: v.optional(v.number()),
     defaultOrderBy: v.optional(v.union(v.literal("vesting"), v.literal("fifo"))),
     defaultLeaseDurationMs: v.optional(v.number()),
     minInactiveBeforeDeleteMs: v.optional(v.number()),

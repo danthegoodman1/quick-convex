@@ -54,6 +54,7 @@ const resolvedConfigValidator = v.object({
   scannerBackoffMaxMs: v.number(),
   pointerBatchSize: v.number(),
   maxConcurrentManagers: v.number(),
+  managerBatchSize: v.number(),
   defaultOrderBy: v.union(v.literal("vesting"), v.literal("fifo")),
   defaultLeaseDurationMs: v.number(),
   minInactiveBeforeDeleteMs: v.number(),
@@ -67,6 +68,7 @@ export type ResolvedConfig = {
   scannerBackoffMaxMs: number
   pointerBatchSize: number
   maxConcurrentManagers: number
+  managerBatchSize: number
   defaultOrderBy: QueueOrder
   defaultLeaseDurationMs: number
   minInactiveBeforeDeleteMs: number
@@ -80,6 +82,7 @@ const CONFIG_DEFAULTS: ResolvedConfig = {
   scannerBackoffMaxMs: 5_000,
   pointerBatchSize: 50,
   maxConcurrentManagers: 10,
+  managerBatchSize: 10,
   defaultOrderBy: DEFAULT_ORDER_BY,
   defaultLeaseDurationMs: DEFAULT_LEASE_DURATION_MS,
   minInactiveBeforeDeleteMs: MIN_INACTIVE_BEFORE_DELETE_MS,
@@ -95,6 +98,7 @@ function applyConfigDefaults(partial: Partial<Config> | null | undefined): Resol
     scannerBackoffMaxMs: partial.scannerBackoffMaxMs ?? CONFIG_DEFAULTS.scannerBackoffMaxMs,
     pointerBatchSize: partial.pointerBatchSize ?? CONFIG_DEFAULTS.pointerBatchSize,
     maxConcurrentManagers: partial.maxConcurrentManagers ?? CONFIG_DEFAULTS.maxConcurrentManagers,
+    managerBatchSize: partial.managerBatchSize ?? CONFIG_DEFAULTS.managerBatchSize,
     defaultOrderBy: partial.defaultOrderBy ?? CONFIG_DEFAULTS.defaultOrderBy,
     defaultLeaseDurationMs: partial.defaultLeaseDurationMs ?? CONFIG_DEFAULTS.defaultLeaseDurationMs,
     minInactiveBeforeDeleteMs: partial.minInactiveBeforeDeleteMs ?? CONFIG_DEFAULTS.minInactiveBeforeDeleteMs,

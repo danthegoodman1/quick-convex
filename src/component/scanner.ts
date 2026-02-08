@@ -70,6 +70,7 @@ export const claimScannerLease = internalMutation({
   returns: v.object({
     valid: v.boolean(),
     orderBy: v.union(v.literal("vesting"), v.literal("fifo")),
+    managerBatchSize: v.number(),
     hasDuePointers: v.boolean(),
     nextPointerLeased: v.boolean(),
     nextPointerVestingTime: v.union(v.null(), v.number()),
@@ -91,6 +92,7 @@ export const claimScannerLease = internalMutation({
       return {
         valid: false,
         orderBy: config.defaultOrderBy,
+        managerBatchSize: config.managerBatchSize,
         hasDuePointers: false,
         nextPointerLeased: false,
         nextPointerVestingTime: null,
@@ -102,6 +104,7 @@ export const claimScannerLease = internalMutation({
       return {
         valid: false,
         orderBy: config.defaultOrderBy,
+        managerBatchSize: config.managerBatchSize,
         hasDuePointers: false,
         nextPointerLeased: false,
         nextPointerVestingTime: null,
@@ -181,6 +184,7 @@ export const claimScannerLease = internalMutation({
     return {
       valid: true,
       orderBy: config.defaultOrderBy,
+      managerBatchSize: config.managerBatchSize,
       hasDuePointers,
       nextPointerLeased:
         nextPointer?.leaseExpiry !== undefined && nextPointer.leaseExpiry > now,
@@ -225,6 +229,7 @@ export const runScanner = internalAction({
           queueId: pointer.queueId,
           pointerLeaseId: pointer.pointerLeaseId,
           orderBy: result.orderBy,
+          managerBatchSize: result.managerBatchSize,
         })
       )
     )
@@ -323,11 +328,12 @@ export const runManager = internalAction({
     queueId: v.string(),
     pointerLeaseId: v.string(),
     orderBy: v.union(v.literal("vesting"), v.literal("fifo")),
+    managerBatchSize: v.number(),
   },
   handler: async (ctx, args) => {
     const items = await ctx.runMutation(internal.lib.dequeue, {
       queueId: args.queueId,
-      limit: 10,
+      limit: args.managerBatchSize,
       orderBy: args.orderBy,
     })
 

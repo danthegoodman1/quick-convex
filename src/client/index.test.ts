@@ -70,6 +70,7 @@ function makeComponentApiMock() {
       config?: {
         defaultOrderBy?: "vesting" | "fifo";
         retryByDefault?: boolean;
+        managerBatchSize?: number;
         defaultRetryBehavior?: {
           maxAttempts: number;
           initialBackoffMs: number;
@@ -101,6 +102,7 @@ function makeComponentApiMock() {
       config?: {
         defaultOrderBy?: "vesting" | "fifo";
         retryByDefault?: boolean;
+        managerBatchSize?: number;
         defaultRetryBehavior?: {
           maxAttempts: number;
           initialBackoffMs: number;
@@ -384,6 +386,7 @@ describe("Quick client", () => {
     const quick = new Quick(component, {
       defaultOrderBy: "fifo",
       retryByDefault: true,
+      managerBatchSize: 42,
       defaultRetryBehavior: {
         maxAttempts: 9,
         initialBackoffMs: 15,
@@ -422,6 +425,7 @@ describe("Quick client", () => {
       config: {
         defaultOrderBy: "fifo",
         retryByDefault: true,
+        managerBatchSize: 42,
         defaultRetryBehavior: {
           maxAttempts: 9,
           initialBackoffMs: 15,
@@ -451,6 +455,7 @@ describe("Quick client", () => {
         config: {
           defaultOrderBy: "fifo",
           retryByDefault: true,
+          managerBatchSize: 42,
           defaultRetryBehavior: {
             maxAttempts: 9,
             initialBackoffMs: 15,

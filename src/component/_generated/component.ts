@@ -36,6 +36,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
               initialBackoffMs: number;
               maxAttempts: number;
             };
+            managerBatchSize?: number;
             maxConcurrentManagers?: number;
             minInactiveBeforeDeleteMs?: number;
             pointerBatchSize?: number;
@@ -74,6 +75,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
               initialBackoffMs: number;
               maxAttempts: number;
             };
+            managerBatchSize?: number;
             maxConcurrentManagers?: number;
             minInactiveBeforeDeleteMs?: number;
             pointerBatchSize?: number;

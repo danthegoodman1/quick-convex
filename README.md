@@ -26,6 +26,7 @@ import { components, api } from "./_generated/api";
 
 const quickVesting = new Quick(components.quickVesting, {
   defaultOrderBy: "vesting",
+  managerBatchSize: 25,
   retryByDefault: true,
   defaultRetryBehavior: {
     maxAttempts: 5,
@@ -158,6 +159,7 @@ export const enqueueEmail = mutation({
 
 - Supports `"vesting"` and `"fifo"` order modes.
 - Uses pointer-based scanning and leasing for concurrent processing.
+- `managerBatchSize` controls how many items a manager dequeues per `queueId` pass (default `10`).
 - Includes cron-based recovery and pointer garbage collection.
 
 ### Choosing an ordering mode
