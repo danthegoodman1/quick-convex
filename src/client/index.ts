@@ -3,11 +3,13 @@ import {
   getFunctionName,
   type FunctionArgs,
   type FunctionReference,
-  type FunctionReturnType,
+  type GenericActionCtx,
+  type GenericDataModel,
 } from "convex/server";
 import type { ComponentApi } from "../component/_generated/component.js";
 
 type WorkerHandlerType = "action" | "mutation";
+export type QuickOrder = "vesting" | "fifo";
 
 type WorkerArgShape<TPayload> = {
   payload: TPayload;
@@ -51,11 +53,13 @@ export type WorkerPayload<
     : never
   : never;
 
-export type QuickCtx = {
-  runMutation: <Ref extends FunctionReference<"mutation", any, any>>(
-    mutation: Ref,
-    args: FunctionArgs<Ref>,
-  ) => Promise<FunctionReturnType<Ref>>;
+export type QuickCtx = Pick<
+  GenericActionCtx<GenericDataModel>,
+  "runMutation"
+>;
+
+export type QuickOptions = {
+  defaultOrderBy?: QuickOrder;
 };
 
 export type EnqueueActionRequest<
@@ -85,7 +89,16 @@ export type EnqueueBatchMutationItem<
 > = EnqueueMutationRequest<Fn>;
 
 export class Quick {
-  constructor(private readonly component: ComponentApi) {}
+  private readonly config?: { defaultOrderBy: QuickOrder };
+
+  constructor(
+    private readonly component: ComponentApi,
+    options?: QuickOptions,
+  ) {
+    this.config = options?.defaultOrderBy
+      ? { defaultOrderBy: options.defaultOrderBy }
+      : undefined;
+  }
 
   async enqueueAction<Fn extends ActionWorkerRef<any>>(
     ctx: QuickCtx,
@@ -138,6 +151,7 @@ export class Quick {
       handler: handle,
       handlerType,
       delayMs: request.delayMs,
+      ...(this.config ? { config: this.config } : {}),
     });
   }
 
@@ -174,6 +188,7 @@ export class Quick {
 
     return await ctx.runMutation(this.component.lib.enqueueBatch, {
       items: mappedItems,
+      ...(this.config ? { config: this.config } : {}),
     });
   }
 }

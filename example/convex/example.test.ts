@@ -20,7 +20,10 @@ describe("example", () => {
       targetId: "post-1",
     });
 
-    const stats = await t.query(api.example.queueStats, { targetId: "post-1" });
+    const stats = await t.query(api.example.queueStats, {
+      targetId: "post-1",
+      mode: "vesting",
+    });
     expect(itemId).toBeDefined();
     expect(stats.itemCount).toBe(1);
   });
@@ -33,8 +36,26 @@ describe("example", () => {
       targetId: "post-2",
     });
 
-    const stats = await t.query(api.example.queueStats, { targetId: "post-2" });
+    const stats = await t.query(api.example.queueStats, {
+      targetId: "post-2",
+      mode: "vesting",
+    });
     expect(itemId).toBeDefined();
     expect(stats.itemCount).toBe(1);
+  });
+
+  test("enqueueCommentBatchActionFifo enqueues jobs in fifo component", async () => {
+    const t = initConvexTest();
+
+    const itemIds = await t.mutation(api.example.enqueueCommentBatchActionFifo, {
+      targetId: "post-fifo",
+    });
+
+    const stats = await t.query(api.example.queueStats, {
+      targetId: "post-fifo",
+      mode: "fifo",
+    });
+    expect(itemIds).toHaveLength(2);
+    expect(stats.itemCount).toBe(2);
   });
 });

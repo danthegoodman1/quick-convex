@@ -49,5 +49,6 @@ export declare const internal: FilterApi<
 >;
 
 export declare const components: {
-  quickConvex: import("@danthegoodman/quick-convex/_generated/component.js").ComponentApi<"quickConvex">;
+  quickVesting: import("@danthegoodman/quick-convex/_generated/component.js").ComponentApi<"quickVesting">;
+  quickFifo: import("@danthegoodman/quick-convex/_generated/component.js").ComponentApi<"quickFifo">;
 };

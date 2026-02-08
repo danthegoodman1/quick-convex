@@ -4,7 +4,12 @@ import { components } from "./_generated/api.js";
 import { makeFunctionReference } from "convex/server";
 import { v } from "convex/values";
 
-const quick = new Quick(components.quickConvex);
+const quickVesting = new Quick(components.quickVesting, {
+  defaultOrderBy: "vesting",
+});
+const quickFifo = new Quick(components.quickFifo, {
+  defaultOrderBy: "fifo",
+});
 
 const processCommentActionRef = makeFunctionReference<
   "action",
@@ -44,7 +49,7 @@ export const enqueueCommentAction = mutation({
   args: { text: v.string(), targetId: v.string(), delayMs: v.optional(v.number()) },
   returns: v.string(),
   handler: async (ctx, args) => {
-    return await quick.enqueueAction(ctx, {
+    return await quickVesting.enqueueAction(ctx, {
       queueId: args.targetId,
       fn: processCommentActionRef,
       args: { text: args.text, targetId: args.targetId },
@@ -57,7 +62,7 @@ export const enqueueCommentMutation = mutation({
   args: { text: v.string(), targetId: v.string(), delayMs: v.optional(v.number()) },
   returns: v.string(),
   handler: async (ctx, args) => {
-    return await quick.enqueueMutation(ctx, {
+    return await quickVesting.enqueueMutation(ctx, {
       queueId: args.targetId,
       fn: processCommentMutationRef,
       args: { text: args.text, targetId: args.targetId },
@@ -66,23 +71,30 @@ export const enqueueCommentMutation = mutation({
   },
 });
 
-export const enqueueCommentBatchAction = mutation({
-  args: {
-    targetId: v.string(),
-    orderBy: v.optional(v.union(v.literal("vesting"), v.literal("fifo"))),
-  },
+export const enqueueCommentBatchActionVesting = mutation({
+  args: { targetId: v.string() },
   returns: v.array(v.string()),
   handler: async (ctx, args) => {
-    if (args.orderBy) {
-      await ctx.runMutation(components.quickConvex.lib.enqueueBatch, {
-        items: [],
-        config: {
-          defaultOrderBy: args.orderBy,
-        },
-      });
-    }
+    return await quickVesting.enqueueBatchAction(ctx, [
+      {
+        queueId: args.targetId,
+        fn: processCommentActionRef,
+        args: { text: "first", targetId: args.targetId },
+      },
+      {
+        queueId: args.targetId,
+        fn: processCommentActionRef,
+        args: { text: "second", targetId: args.targetId },
+      },
+    ]);
+  },
+});
 
-    return await quick.enqueueBatchAction(ctx, [
+export const enqueueCommentBatchActionFifo = mutation({
+  args: { targetId: v.string() },
+  returns: v.array(v.string()),
+  handler: async (ctx, args) => {
+    return await quickFifo.enqueueBatchAction(ctx, [
       {
         queueId: args.targetId,
         fn: processCommentActionRef,
@@ -98,9 +110,15 @@ export const enqueueCommentBatchAction = mutation({
 });
 
 export const queueStats = query({
-  args: { targetId: v.string() },
+  args: {
+    targetId: v.string(),
+    mode: v.optional(v.union(v.literal("vesting"), v.literal("fifo"))),
+  },
   handler: async (ctx, args) => {
-    return await ctx.runQuery(components.quickConvex.lib.getQueueStats, {
+    const component =
+      args.mode === "fifo" ? components.quickFifo : components.quickVesting;
+
+    return await ctx.runQuery(component.lib.getQueueStats, {
       queueId: args.targetId,
     });
   },

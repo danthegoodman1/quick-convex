@@ -40,6 +40,7 @@ function makeComponentApiMock() {
       handler: string;
       handlerType?: "action" | "mutation";
       delayMs?: number;
+      config?: { defaultOrderBy: "vesting" | "fifo" };
     }
   >("component.lib:enqueue");
 
@@ -53,6 +54,7 @@ function makeComponentApiMock() {
         handlerType?: "action" | "mutation";
         delayMs?: number;
       }>;
+      config?: { defaultOrderBy: "vesting" | "fifo" };
     }
   >("component.lib:enqueueBatch");
 
@@ -181,5 +183,54 @@ describe("Quick client", () => {
         },
       ],
     });
+  });
+
+  test("constructor defaultOrderBy is forwarded to enqueue and enqueueBatch", async () => {
+    const ctx = makeCtxMock();
+    const component = makeComponentApiMock();
+    const quick = new Quick(component, { defaultOrderBy: "fifo" });
+    const handleMock = vi.mocked(createFunctionHandle);
+    handleMock.mockImplementation(
+      async (fn: FunctionReference<any, any, any>) =>
+        `handle:${getFunctionName(fn)}` as any,
+    );
+    ctx.runMutation.mockResolvedValueOnce("item-id");
+    ctx.runMutation.mockResolvedValueOnce(["id-1"]);
+
+    await quick.enqueueAction(ctx, {
+      queueId: "queue-config",
+      fn: actionWorkerRef,
+      args: { value: 99 },
+    });
+
+    await quick.enqueueBatchAction(ctx, [
+      { queueId: "queue-config", fn: actionWorkerRef, args: { value: 100 } },
+    ]);
+
+    expect(ctx.runMutation).toHaveBeenNthCalledWith(1, component.lib.enqueue, {
+      queueId: "queue-config",
+      payload: { value: 99 },
+      handler: "handle:index.test:workerAction",
+      handlerType: "action",
+      delayMs: undefined,
+      config: { defaultOrderBy: "fifo" },
+    });
+
+    expect(ctx.runMutation).toHaveBeenNthCalledWith(
+      2,
+      component.lib.enqueueBatch,
+      {
+        items: [
+          {
+            queueId: "queue-config",
+            payload: { value: 100 },
+            handler: "handle:index.test:workerAction",
+            handlerType: "action",
+            delayMs: undefined,
+          },
+        ],
+        config: { defaultOrderBy: "fifo" },
+      },
+    );
   });
 });

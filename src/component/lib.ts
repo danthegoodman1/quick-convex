@@ -537,27 +537,6 @@ export const complete = internalMutation({
 
     await ctx.db.delete(args.itemId)
 
-    const remainingItems = await ctx.db
-      .query("queueItems")
-      .withIndex("by_queue_and_vesting_time", (q) =>
-        q.eq("queueId", item.queueId)
-      )
-      .first()
-
-    if (!remainingItems) {
-      const pointer = await ctx.db
-        .query("queuePointers")
-        .withIndex("by_queue", (q) => q.eq("queueId", item.queueId))
-        .unique()
-
-      if (pointer) {
-        await ctx.db.patch(pointer._id, {
-          leaseId: undefined,
-          leaseExpiry: undefined,
-        })
-      }
-    }
-
     return true
   },
 })
