@@ -13,11 +13,26 @@ import schema from "./schema.js"
 
 export type QueueOrder = "vesting" | "fifo"
 export type HandlerType = "action" | "mutation"
+export type CompletionStatus = "success" | "failure" | "cancelled"
 
 const DEFAULT_LEASE_DURATION_MS = 30_000
 const MIN_INACTIVE_BEFORE_DELETE_MS = 60_000
-const MAX_RETRIES = 10
 const DEFAULT_ORDER_BY: QueueOrder = "vesting"
+const DEFAULT_RETRY_BY_DEFAULT = false
+const DEFAULT_ON_COMPLETE_TIMEOUT_RETRIES = 2
+
+export const retryBehaviorValidator = v.object({
+  maxAttempts: v.number(),
+  initialBackoffMs: v.number(),
+  base: v.number(),
+})
+export type RetryBehavior = typeof retryBehaviorValidator.type
+
+const DEFAULT_RETRY_BEHAVIOR: RetryBehavior = {
+  maxAttempts: 5,
+  initialBackoffMs: 250,
+  base: 2,
+}
 
 const queueItemValidator = schema.tables.queueItems.validator.extend({
   _id: v.id("queueItems"),
@@ -42,7 +57,8 @@ const resolvedConfigValidator = v.object({
   defaultOrderBy: v.union(v.literal("vesting"), v.literal("fifo")),
   defaultLeaseDurationMs: v.number(),
   minInactiveBeforeDeleteMs: v.number(),
-  maxRetries: v.number(),
+  retryByDefault: v.boolean(),
+  defaultRetryBehavior: retryBehaviorValidator,
 })
 
 export type ResolvedConfig = {
@@ -54,7 +70,8 @@ export type ResolvedConfig = {
   defaultOrderBy: QueueOrder
   defaultLeaseDurationMs: number
   minInactiveBeforeDeleteMs: number
-  maxRetries: number
+  retryByDefault: boolean
+  defaultRetryBehavior: RetryBehavior
 }
 
 const CONFIG_DEFAULTS: ResolvedConfig = {
@@ -66,7 +83,8 @@ const CONFIG_DEFAULTS: ResolvedConfig = {
   defaultOrderBy: DEFAULT_ORDER_BY,
   defaultLeaseDurationMs: DEFAULT_LEASE_DURATION_MS,
   minInactiveBeforeDeleteMs: MIN_INACTIVE_BEFORE_DELETE_MS,
-  maxRetries: MAX_RETRIES,
+  retryByDefault: DEFAULT_RETRY_BY_DEFAULT,
+  defaultRetryBehavior: DEFAULT_RETRY_BEHAVIOR,
 }
 
 function applyConfigDefaults(partial: Partial<Config> | null | undefined): ResolvedConfig {
@@ -80,7 +98,8 @@ function applyConfigDefaults(partial: Partial<Config> | null | undefined): Resol
     defaultOrderBy: partial.defaultOrderBy ?? CONFIG_DEFAULTS.defaultOrderBy,
     defaultLeaseDurationMs: partial.defaultLeaseDurationMs ?? CONFIG_DEFAULTS.defaultLeaseDurationMs,
     minInactiveBeforeDeleteMs: partial.minInactiveBeforeDeleteMs ?? CONFIG_DEFAULTS.minInactiveBeforeDeleteMs,
-    maxRetries: partial.maxRetries ?? CONFIG_DEFAULTS.maxRetries,
+    retryByDefault: partial.retryByDefault ?? CONFIG_DEFAULTS.retryByDefault,
+    defaultRetryBehavior: partial.defaultRetryBehavior ?? CONFIG_DEFAULTS.defaultRetryBehavior,
   }
 }
 
@@ -109,6 +128,69 @@ function resolveVestingTime(
   }
 
   return now
+}
+
+export function resolveItemRetryPolicy(
+  config: ResolvedConfig,
+  args: {
+    retry?: boolean
+    retryBehavior?: RetryBehavior
+  }
+): {
+  retryEnabled: boolean
+  retryBehavior?: RetryBehavior
+} {
+  const retryEnabled =
+    args.retry ?? (args.retryBehavior ? true : config.retryByDefault)
+  if (!retryEnabled) {
+    return { retryEnabled: false }
+  }
+  return {
+    retryEnabled: true,
+    retryBehavior: args.retryBehavior ?? config.defaultRetryBehavior,
+  }
+}
+
+export function getRetryDelayMs(
+  retryBehavior: RetryBehavior,
+  attemptNumber: number
+): number {
+  const exponent = Math.max(0, attemptNumber - 1)
+  return retryBehavior.initialBackoffMs * Math.pow(retryBehavior.base, exponent)
+}
+
+export function isTimeoutError(error: unknown): boolean {
+  const messages: string[] = []
+
+  if (typeof error === "string") {
+    messages.push(error)
+  }
+
+  if (error && typeof error === "object") {
+    const candidate = error as {
+      message?: unknown
+      cause?: unknown
+      data?: unknown
+    }
+
+    if (typeof candidate.message === "string") {
+      messages.push(candidate.message)
+    }
+    if (typeof candidate.cause === "string") {
+      messages.push(candidate.cause)
+    }
+    if (candidate.data && typeof candidate.data === "object") {
+      const data = candidate.data as { message?: unknown }
+      if (typeof data.message === "string") {
+        messages.push(data.message)
+      }
+    } else if (typeof candidate.data === "string") {
+      messages.push(candidate.data)
+    }
+  }
+
+  messages.push(String(error))
+  return messages.some((message) => /timed out|timeout/i.test(message))
 }
 
 export const getResolvedConfig = internalQuery({
@@ -181,6 +263,10 @@ export const enqueue = mutation({
     payload: v.any(),
     handler: v.string(),
     handlerType: v.optional(v.union(v.literal("action"), v.literal("mutation"))),
+    onCompleteHandler: v.optional(v.string()),
+    onCompleteContext: v.optional(v.any()),
+    retry: v.optional(v.boolean()),
+    retryBehavior: v.optional(retryBehaviorValidator),
     runAfter: v.optional(v.number()),
     runAt: v.optional(v.number()),
     config: v.optional(configValidator),
@@ -190,14 +276,24 @@ export const enqueue = mutation({
     if (args.config) {
       await resolveAndMaybeUpdateConfig(ctx, args.config)
     }
+    const resolvedConfig = await resolveConfig(ctx)
     const now = Date.now()
     const vestingTime = resolveVestingTime(now, args)
+    const retryPolicy = resolveItemRetryPolicy(resolvedConfig, {
+      retry: args.retry,
+      retryBehavior: args.retryBehavior,
+    })
 
     const itemId = await ctx.db.insert("queueItems", {
       queueId: args.queueId,
       payload: args.payload,
       handler: args.handler,
       handlerType: args.handlerType ?? "action",
+      onCompleteHandler: args.onCompleteHandler,
+      onCompleteContext: args.onCompleteContext,
+      phase: "run",
+      retryEnabled: retryPolicy.retryEnabled,
+      retryBehavior: retryPolicy.retryBehavior,
       vestingTime,
       errorCount: 0,
     })
@@ -235,6 +331,10 @@ export const enqueueBatch = mutation({
         payload: v.any(),
         handler: v.string(),
         handlerType: v.optional(v.union(v.literal("action"), v.literal("mutation"))),
+        onCompleteHandler: v.optional(v.string()),
+        onCompleteContext: v.optional(v.any()),
+        retry: v.optional(v.boolean()),
+        retryBehavior: v.optional(retryBehaviorValidator),
         runAfter: v.optional(v.number()),
         runAt: v.optional(v.number()),
       })
@@ -246,6 +346,7 @@ export const enqueueBatch = mutation({
     if (args.config) {
       await resolveAndMaybeUpdateConfig(ctx, args.config)
     }
+    const resolvedConfig = await resolveConfig(ctx)
     const now = Date.now()
     const itemIds: Array<typeof schema.tables.queueItems.validator.type & { _id: string }> = []
     const pointerUpdates = new Map<
@@ -255,12 +356,21 @@ export const enqueueBatch = mutation({
 
     for (const item of args.items) {
       const vestingTime = resolveVestingTime(now, item)
+      const retryPolicy = resolveItemRetryPolicy(resolvedConfig, {
+        retry: item.retry,
+        retryBehavior: item.retryBehavior,
+      })
 
       const itemId = await ctx.db.insert("queueItems", {
         queueId: item.queueId,
         payload: item.payload,
         handler: item.handler,
         handlerType: item.handlerType ?? "action",
+        onCompleteHandler: item.onCompleteHandler,
+        onCompleteContext: item.onCompleteContext,
+        phase: "run",
+        retryEnabled: retryPolicy.retryEnabled,
+        retryBehavior: retryPolicy.retryBehavior,
         vestingTime,
         errorCount: 0,
       })
@@ -542,90 +652,180 @@ export const dequeue = internalMutation({
   },
 })
 
-export const complete = internalMutation({
+async function schedulePointerWakeIfEarlier(
+  ctx: MutationCtx,
+  queueId: string,
+  vestingTime: number
+) {
+  const pointer = await ctx.db
+    .query("queuePointers")
+    .withIndex("by_queue", (q) => q.eq("queueId", queueId))
+    .unique()
+  if (pointer && vestingTime < pointer.vestingTime) {
+    await ctx.scheduler.runAfter(0, internal.lib.updatePointerVesting, {
+      queueId,
+      vestingTime,
+    })
+  }
+}
+
+export const prepareActionWorkerExecution = internalMutation({
   args: {
     itemId: v.id("queueItems"),
-    leaseId: v.optional(v.string()),
+    leaseId: v.string(),
   },
-  returns: v.boolean(),
+  returns: v.object({
+    valid: v.boolean(),
+    phase: v.union(v.literal("run"), v.literal("onComplete")),
+  }),
   handler: async (ctx, args) => {
     const item = await ctx.db.get(args.itemId)
-
-    if (!item) {
-      return false
+    if (!item || item.leaseId !== args.leaseId) {
+      return {
+        valid: false,
+        phase: "run" as const,
+      }
     }
-
-    if (args.leaseId && item.leaseId !== args.leaseId) {
-      return false
+    return {
+      valid: true,
+      phase: (item.phase ?? "run") as "run" | "onComplete",
     }
-
-    await ctx.db.delete(args.itemId)
-
-    return true
   },
 })
 
-export const requeue = internalMutation({
+async function runOnCompleteForItem(
+  ctx: MutationCtx,
+  item: typeof queueItemValidator.type,
+  _leaseId: string
+): Promise<{
+  done: boolean
+  retriedOnComplete: boolean
+}> {
+  if (!item.onCompleteHandler) {
+    await ctx.db.delete(item._id)
+    return { done: true, retriedOnComplete: false }
+  }
+
+  try {
+    const fnHandle = item.onCompleteHandler as any
+    await ctx.runMutation(fnHandle, {
+      workId: item._id,
+      context: item.onCompleteContext,
+      status: item.completionStatus ?? "failure",
+      result: item.completionResult,
+    })
+    await ctx.db.delete(item._id)
+    return { done: true, retriedOnComplete: false }
+  } catch (error) {
+    const timeoutRetries = item.onCompleteTimeoutRetries ?? 0
+    if (
+      isTimeoutError(error) &&
+      timeoutRetries < DEFAULT_ON_COMPLETE_TIMEOUT_RETRIES
+    ) {
+      const now = Date.now()
+      const retryVestingTime = now + 100
+      await ctx.db.patch(item._id, {
+        onCompleteTimeoutRetries: timeoutRetries + 1,
+        vestingTime: retryVestingTime,
+        leaseId: undefined,
+        leaseExpiry: undefined,
+      })
+      await schedulePointerWakeIfEarlier(ctx, item.queueId, retryVestingTime)
+      return { done: false, retriedOnComplete: true }
+    }
+
+    console.error("[quick] onComplete terminal failure", error)
+    await ctx.db.delete(item._id)
+    return { done: true, retriedOnComplete: false }
+  }
+}
+
+export const finalizeActionWorker = internalMutation({
   args: {
     itemId: v.id("queueItems"),
-    leaseId: v.optional(v.string()),
-    delayMs: v.optional(v.number()),
-    error: v.optional(v.string()),
+    leaseId: v.string(),
+    status: v.optional(
+      v.union(v.literal("success"), v.literal("failure"), v.literal("cancelled"))
+    ),
+    result: v.optional(v.any()),
   },
-  returns: v.boolean(),
+  returns: v.object({
+    done: v.boolean(),
+    retriedWork: v.boolean(),
+    retriedOnComplete: v.boolean(),
+  }),
   handler: async (ctx, args) => {
-    const config = await resolveConfig(ctx)
-    const now = Date.now()
     const item = await ctx.db.get(args.itemId)
-
-    if (!item) {
-      return false
+    if (!item || item.leaseId !== args.leaseId) {
+      return {
+        done: false,
+        retriedWork: false,
+        retriedOnComplete: false,
+      }
     }
 
-    if (args.leaseId && item.leaseId !== args.leaseId) {
-      return false
+    if ((item.phase ?? "run") === "onComplete") {
+      const result = await runOnCompleteForItem(ctx, item as any, args.leaseId)
+      return {
+        done: result.done,
+        retriedWork: false,
+        retriedOnComplete: result.retriedOnComplete,
+      }
     }
 
-    const newErrorCount = item.errorCount + 1
-
-    if (newErrorCount > config.maxRetries) {
-      await ctx.db.insert("deadLetterItems", {
-        queueId: item.queueId,
-        payload: item.payload,
-        handler: item.handler,
-        handlerType: item.handlerType ?? "action",
-        errorCount: newErrorCount,
-        lastError: args.error,
-        movedAt: now,
-      })
-      await ctx.db.delete(args.itemId)
-      return true
+    if (!args.status) {
+      return {
+        done: false,
+        retriedWork: false,
+        retriedOnComplete: false,
+      }
     }
 
-    const backoffMs = args.delayMs ?? Math.min(1000 * Math.pow(2, newErrorCount), 300_000)
-    const vestingTime = now + backoffMs
+    if (args.status === "failure") {
+      const retryEnabled = item.retryEnabled ?? false
+      const retryBehavior = item.retryBehavior ?? DEFAULT_RETRY_BEHAVIOR
+      const nextErrorCount = item.errorCount + 1
+      const maxAttempts = Math.max(1, retryBehavior.maxAttempts)
 
-    await ctx.db.patch(args.itemId, {
-      vestingTime,
-      errorCount: newErrorCount,
-      leaseId: undefined,
-      leaseExpiry: undefined,
+      if (retryEnabled && nextErrorCount < maxAttempts) {
+        const backoffMs = getRetryDelayMs(retryBehavior, nextErrorCount)
+        const retryVestingTime = Date.now() + backoffMs
+        await ctx.db.patch(item._id, {
+          errorCount: nextErrorCount,
+          vestingTime: retryVestingTime,
+          leaseId: undefined,
+          leaseExpiry: undefined,
+        })
+        await schedulePointerWakeIfEarlier(ctx, item.queueId, retryVestingTime)
+        return {
+          done: false,
+          retriedWork: true,
+          retriedOnComplete: false,
+        }
+      }
+    }
+
+    await ctx.db.patch(item._id, {
+      phase: "onComplete",
+      completionStatus: args.status,
+      completionResult: args.result,
     })
 
-    const pointer = await ctx.db
-      .query("queuePointers")
-      .withIndex("by_queue", (q) => q.eq("queueId", item.queueId))
-      .unique()
-
-    if (pointer && vestingTime < pointer.vestingTime) {
-      await ctx.db.patch(pointer._id, {
-        vestingTime,
-        lastActiveTime: now,
-      })
-      await ctx.scheduler.runAfter(0, internal.scanner.tryWakeScanner, {})
+    const refreshed = await ctx.db.get(item._id)
+    if (!refreshed || refreshed.leaseId !== args.leaseId) {
+      return {
+        done: false,
+        retriedWork: false,
+        retriedOnComplete: false,
+      }
     }
 
-    return true
+    const onCompleteResult = await runOnCompleteForItem(ctx, refreshed as any, args.leaseId)
+    return {
+      done: onCompleteResult.done,
+      retriedWork: false,
+      retriedOnComplete: onCompleteResult.retriedOnComplete,
+    }
   },
 })
 
@@ -710,7 +910,6 @@ export const getQueueStats = query({
     itemCount: v.number(),
     pendingCount: v.number(),
     leasedCount: v.number(),
-    deadLetterCount: v.number(),
   }),
   handler: async (ctx, args) => {
     const now = Date.now()
@@ -720,11 +919,6 @@ export const getQueueStats = query({
       .withIndex("by_queue_and_vesting_time", (q) =>
         q.eq("queueId", args.queueId)
       )
-      .collect()
-
-    const deadLetters = await ctx.db
-      .query("deadLetterItems")
-      .withIndex("by_queue", (q) => q.eq("queueId", args.queueId))
       .collect()
 
     const pendingCount = items.filter(
@@ -740,91 +934,6 @@ export const getQueueStats = query({
       itemCount: items.length,
       pendingCount,
       leasedCount,
-      deadLetterCount: deadLetters.length,
     }
-  },
-})
-
-export const listDeadLetters = query({
-  args: {
-    queueId: v.optional(v.string()),
-    limit: v.optional(v.number()),
-  },
-  returns: v.array(
-    schema.tables.deadLetterItems.validator.extend({
-      _id: v.id("deadLetterItems"),
-      _creationTime: v.number(),
-    })
-  ),
-  handler: async (ctx, args) => {
-    const limit = args.limit ?? 100
-    const { queueId } = args
-
-    if (queueId) {
-      return await ctx.db
-        .query("deadLetterItems")
-        .withIndex("by_queue", (q) => q.eq("queueId", queueId))
-        .take(limit)
-    }
-
-    return await ctx.db.query("deadLetterItems").take(limit)
-  },
-})
-
-export const replayDeadLetter = mutation({
-  args: {
-    deadLetterId: v.id("deadLetterItems"),
-    runAfter: v.optional(v.number()),
-    runAt: v.optional(v.number()),
-  },
-  returns: v.union(v.null(), v.id("queueItems")),
-  handler: async (ctx, args) => {
-    const deadLetter = await ctx.db.get(args.deadLetterId)
-
-    if (!deadLetter) {
-      return null
-    }
-
-    const now = Date.now()
-    const vestingTime = resolveVestingTime(now, args)
-
-    const itemId = await ctx.db.insert("queueItems", {
-      queueId: deadLetter.queueId,
-      payload: deadLetter.payload,
-      handler: deadLetter.handler,
-      handlerType: deadLetter.handlerType ?? "action",
-      vestingTime,
-      errorCount: 0,
-    })
-
-    const existingPointer = await ctx.db
-      .query("queuePointers")
-      .withIndex("by_queue", (q) => q.eq("queueId", deadLetter.queueId))
-      .unique()
-
-    if (existingPointer) {
-      if (vestingTime < existingPointer.vestingTime) {
-        await ctx.db.patch(existingPointer._id, {
-          vestingTime,
-          lastActiveTime: now,
-        })
-        await ctx.scheduler.runAfter(0, internal.scanner.tryWakeScanner, {})
-      } else {
-        await ctx.db.patch(existingPointer._id, {
-          lastActiveTime: now,
-        })
-      }
-    } else {
-      await ctx.db.insert("queuePointers", {
-        queueId: deadLetter.queueId,
-        vestingTime,
-        lastActiveTime: now,
-      })
-      await ctx.scheduler.runAfter(0, internal.scanner.tryWakeScanner, {})
-    }
-
-    await ctx.db.delete(args.deadLetterId)
-
-    return itemId
   },
 })

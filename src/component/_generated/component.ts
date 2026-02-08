@@ -31,18 +31,31 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
           config?: {
             defaultLeaseDurationMs?: number;
             defaultOrderBy?: "vesting" | "fifo";
+            defaultRetryBehavior?: {
+              base: number;
+              initialBackoffMs: number;
+              maxAttempts: number;
+            };
             maxConcurrentManagers?: number;
-            maxRetries?: number;
             minInactiveBeforeDeleteMs?: number;
             pointerBatchSize?: number;
+            retryByDefault?: boolean;
             scannerBackoffMaxMs?: number;
             scannerBackoffMinMs?: number;
             scannerLeaseDurationMs?: number;
           };
           handler: string;
           handlerType?: "action" | "mutation";
+          onCompleteContext?: any;
+          onCompleteHandler?: string;
           payload: any;
           queueId: string;
+          retry?: boolean;
+          retryBehavior?: {
+            base: number;
+            initialBackoffMs: number;
+            maxAttempts: number;
+          };
           runAfter?: number;
           runAt?: number;
         },
@@ -56,10 +69,15 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
           config?: {
             defaultLeaseDurationMs?: number;
             defaultOrderBy?: "vesting" | "fifo";
+            defaultRetryBehavior?: {
+              base: number;
+              initialBackoffMs: number;
+              maxAttempts: number;
+            };
             maxConcurrentManagers?: number;
-            maxRetries?: number;
             minInactiveBeforeDeleteMs?: number;
             pointerBatchSize?: number;
+            retryByDefault?: boolean;
             scannerBackoffMaxMs?: number;
             scannerBackoffMinMs?: number;
             scannerLeaseDurationMs?: number;
@@ -67,8 +85,16 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
           items: Array<{
             handler: string;
             handlerType?: "action" | "mutation";
+            onCompleteContext?: any;
+            onCompleteHandler?: string;
             payload: any;
             queueId: string;
+            retry?: boolean;
+            retryBehavior?: {
+              base: number;
+              initialBackoffMs: number;
+              maxAttempts: number;
+            };
             runAfter?: number;
             runAt?: number;
           }>;
@@ -80,36 +106,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
         "query",
         "internal",
         { queueId: string },
-        {
-          deadLetterCount: number;
-          itemCount: number;
-          leasedCount: number;
-          pendingCount: number;
-        },
-        Name
-      >;
-      listDeadLetters: FunctionReference<
-        "query",
-        "internal",
-        { limit?: number; queueId?: string },
-        Array<{
-          _creationTime: number;
-          _id: string;
-          errorCount: number;
-          handler: string;
-          handlerType?: "action" | "mutation";
-          lastError?: string;
-          movedAt: number;
-          payload: any;
-          queueId: string;
-        }>,
-        Name
-      >;
-      replayDeadLetter: FunctionReference<
-        "mutation",
-        "internal",
-        { deadLetterId: string; runAfter?: number; runAt?: number },
-        null | string,
+        { itemCount: number; leasedCount: number; pendingCount: number },
         Name
       >;
     };

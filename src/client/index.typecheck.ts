@@ -1,5 +1,6 @@
 import { makeFunctionReference } from "convex/server";
-import { Quick } from "./index.js";
+import { v } from "convex/values";
+import { Quick, type EnqueueActionRequest, vOnCompleteArgs } from "./index.js";
 
 declare const quick: Quick;
 declare const ctx: { runMutation: (...args: any[]) => Promise<any> };
@@ -16,6 +17,15 @@ const mutationWorker = makeFunctionReference<
   "mutation",
   { payload: { value: number }; queueId: string }
 >("types:testMutation");
+const completionWorker = makeFunctionReference<
+  "mutation",
+  {
+    workId: string;
+    context?: { traceId: string };
+    status: "success" | "failure" | "cancelled";
+    result: any;
+  }
+>("types:testOnComplete");
 const wrongShapeWorker = makeFunctionReference<
   "action",
   { payload: { value: number }; queueId: string; extra: string }
@@ -26,6 +36,10 @@ void quick.enqueueAction(ctx, {
   fn: actionWorker,
   args: { value: 1 },
   runAfter: 1_000,
+  onComplete: {
+    fn: completionWorker,
+    context: { traceId: "x" },
+  },
 });
 
 void quick.enqueueMutation(ctx, {
@@ -60,8 +74,25 @@ void quick.enqueueMutation(ctx, { queueId: "queue-a", fn: mutationWorker, args: 
 // @ts-expect-error worker args must be exactly payload + queueId
 void quick.enqueueAction(ctx, { queueId: "queue-a", fn: wrongShapeWorker, args: { value: 1 } });
 
-// @ts-expect-error delayMs was replaced by runAfter/runAt
-void quick.enqueueAction(ctx, { queueId: "queue-a", fn: actionWorker, args: { value: 1 }, delayMs: 1 });
+const delayedRequest: EnqueueActionRequest<typeof actionWorker> = {
+  queueId: "queue-a",
+  fn: actionWorker,
+  args: { value: 1 },
+  // @ts-expect-error delayMs was replaced by runAfter/runAt
+  delayMs: 1,
+};
+void delayedRequest;
+
+void quick.enqueueAction(ctx, {
+  queueId: "queue-a",
+  fn: actionWorker,
+  args: { value: 1 },
+  onComplete: {
+    fn: completionWorker,
+    // @ts-expect-error onComplete context type mismatch
+    context: { bad: 1 },
+  },
+});
 
 void quick.enqueueBatchAction(ctx, [
   {
@@ -79,3 +110,6 @@ void quick.enqueueBatchAction(ctx, [
 
 // @ts-expect-error mutation workers are not allowed in action batch
 void quick.enqueueBatchAction(ctx, [{ queueId: "queue-a", fn: mutationWorker, args: { value: 1 } }]);
+
+const validator = vOnCompleteArgs(v.object({ traceId: v.string() }));
+void validator;

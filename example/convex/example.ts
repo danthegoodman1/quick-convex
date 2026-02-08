@@ -1,4 +1,4 @@
-import { Quick } from "@danthegoodman/quick-convex";
+import { Quick, vOnCompleteArgs } from "@danthegoodman/quick-convex";
 import { action, mutation, query } from "./_generated/server.js";
 import { components } from "./_generated/api.js";
 import { makeFunctionReference } from "convex/server";
@@ -20,6 +20,16 @@ const processCommentMutationRef = makeFunctionReference<
   "mutation",
   { payload: { text: string; targetId: string }; queueId: string }
 >("example:processCommentMutation");
+
+const onCommentProcessedRef = makeFunctionReference<
+  "mutation",
+  {
+    workId: string;
+    context?: { targetId: string };
+    status: "success" | "failure" | "cancelled";
+    result: any;
+  }
+>("example:onCommentProcessed");
 
 export const processCommentAction = action({
   args: {
@@ -45,6 +55,12 @@ export const processCommentMutation = mutation({
   handler: async () => null,
 });
 
+export const onCommentProcessed = mutation({
+  args: vOnCompleteArgs(v.object({ targetId: v.string() })),
+  returns: v.null(),
+  handler: async () => null,
+});
+
 export const enqueueCommentAction = mutation({
   args: {
     text: v.string(),
@@ -60,6 +76,10 @@ export const enqueueCommentAction = mutation({
       args: { text: args.text, targetId: args.targetId },
       runAfter: args.runAfter,
       runAt: args.runAt,
+      onComplete: {
+        fn: onCommentProcessedRef,
+        context: { targetId: args.targetId },
+      },
     });
   },
 });
@@ -79,6 +99,10 @@ export const enqueueCommentMutation = mutation({
       args: { text: args.text, targetId: args.targetId },
       runAfter: args.runAfter,
       runAt: args.runAt,
+      onComplete: {
+        fn: onCommentProcessedRef,
+        context: { targetId: args.targetId },
+      },
     });
   },
 });

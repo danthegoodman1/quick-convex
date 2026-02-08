@@ -30,6 +30,24 @@ const mutationWorkerRef = makeFunctionReference<
   "mutation",
   { payload: { value: number }; queueId: string }
 >("index.test:workerMutation");
+const onCompleteRef = makeFunctionReference<
+  "mutation",
+  {
+    workId: string;
+    context?: { tag: string };
+    status: "success" | "failure" | "cancelled";
+    result: any;
+  }
+>("index.test:onComplete");
+const onCompleteTwoRef = makeFunctionReference<
+  "mutation",
+  {
+    workId: string;
+    context?: { tag: string };
+    status: "success" | "failure" | "cancelled";
+    result: any;
+  }
+>("index.test:onCompleteTwo");
 
 function makeComponentApiMock() {
   const enqueueRef = makeFunctionReference<
@@ -41,7 +59,23 @@ function makeComponentApiMock() {
       handlerType?: "action" | "mutation";
       runAfter?: number;
       runAt?: number;
-      config?: { defaultOrderBy: "vesting" | "fifo" };
+      retry?: boolean;
+      retryBehavior?: {
+        maxAttempts: number;
+        initialBackoffMs: number;
+        base: number;
+      };
+      onCompleteHandler?: string;
+      onCompleteContext?: any;
+      config?: {
+        defaultOrderBy?: "vesting" | "fifo";
+        retryByDefault?: boolean;
+        defaultRetryBehavior?: {
+          maxAttempts: number;
+          initialBackoffMs: number;
+          base: number;
+        };
+      };
     }
   >("component.lib:enqueue");
 
@@ -55,8 +89,24 @@ function makeComponentApiMock() {
         handlerType?: "action" | "mutation";
         runAfter?: number;
         runAt?: number;
+        retry?: boolean;
+        retryBehavior?: {
+          maxAttempts: number;
+          initialBackoffMs: number;
+          base: number;
+        };
+        onCompleteHandler?: string;
+        onCompleteContext?: any;
       }>;
-      config?: { defaultOrderBy: "vesting" | "fifo" };
+      config?: {
+        defaultOrderBy?: "vesting" | "fifo";
+        retryByDefault?: boolean;
+        defaultRetryBehavior?: {
+          maxAttempts: number;
+          initialBackoffMs: number;
+          base: number;
+        };
+      };
     }
   >("component.lib:enqueueBatch");
 
@@ -137,6 +187,55 @@ describe("Quick client", () => {
       handlerType: "mutation",
       runAfter: undefined,
       runAt: undefined,
+      retry: undefined,
+      retryBehavior: undefined,
+      onCompleteHandler: undefined,
+      onCompleteContext: undefined,
+    });
+  });
+
+  test("enqueueAction forwards retry and onComplete", async () => {
+    const ctx = makeCtxMock();
+    const component = makeComponentApiMock();
+    const quick = new Quick(component);
+    const handleMock = vi.mocked(createFunctionHandle);
+    handleMock
+      .mockResolvedValueOnce("action-handle" as any)
+      .mockResolvedValueOnce("completion-handle" as any);
+    ctx.runMutation.mockResolvedValueOnce("item-id");
+
+    await quick.enqueueAction(ctx, {
+      queueId: "queue-on-complete",
+      fn: actionWorkerRef,
+      args: { value: 9 },
+      retry: {
+        maxAttempts: 7,
+        initialBackoffMs: 10,
+        base: 3,
+      },
+      onComplete: {
+        fn: onCompleteRef,
+        context: { tag: "ctx" },
+      },
+    });
+
+    expect(handleMock).toHaveBeenNthCalledWith(1, actionWorkerRef);
+    expect(handleMock).toHaveBeenNthCalledWith(2, onCompleteRef);
+    expect(ctx.runMutation).toHaveBeenCalledWith(component.lib.enqueue, {
+      queueId: "queue-on-complete",
+      payload: { value: 9 },
+      handler: "action-handle",
+      handlerType: "action",
+      runAfter: undefined,
+      runAt: undefined,
+      retry: true,
+      retryBehavior: {
+        maxAttempts: 7,
+        initialBackoffMs: 10,
+        base: 3,
+      },
+      onCompleteHandler: "completion-handle",
+      onCompleteContext: { tag: "ctx" },
     });
   });
 
@@ -171,6 +270,10 @@ describe("Quick client", () => {
           handlerType: "action",
           runAfter: undefined,
           runAt: undefined,
+          retry: undefined,
+          retryBehavior: undefined,
+          onCompleteHandler: undefined,
+          onCompleteContext: undefined,
         },
         {
           queueId: "queue-c",
@@ -179,6 +282,10 @@ describe("Quick client", () => {
           handlerType: "action",
           runAfter: undefined,
           runAt: undefined,
+          retry: undefined,
+          retryBehavior: undefined,
+          onCompleteHandler: undefined,
+          onCompleteContext: undefined,
         },
         {
           queueId: "queue-c",
@@ -187,6 +294,85 @@ describe("Quick client", () => {
           handlerType: "action",
           runAfter: undefined,
           runAt: undefined,
+          retry: undefined,
+          retryBehavior: undefined,
+          onCompleteHandler: undefined,
+          onCompleteContext: undefined,
+        },
+      ],
+    });
+  });
+
+  test("enqueueBatchAction dedupes onComplete handles", async () => {
+    const ctx = makeCtxMock();
+    const component = makeComponentApiMock();
+    const quick = new Quick(component);
+    const handleMock = vi.mocked(createFunctionHandle);
+    handleMock.mockImplementation(
+      async (fn: FunctionReference<any, any, any>) =>
+        `handle:${getFunctionName(fn)}` as any,
+    );
+    ctx.runMutation.mockResolvedValueOnce(["id-1", "id-2", "id-3"]);
+
+    await quick.enqueueBatchAction(ctx, [
+      {
+        queueId: "queue-c",
+        fn: actionWorkerRef,
+        args: { value: 1 },
+        onComplete: { fn: onCompleteRef, context: { tag: "one" } },
+      },
+      {
+        queueId: "queue-c",
+        fn: actionWorkerRef,
+        args: { value: 2 },
+        onComplete: { fn: onCompleteRef, context: { tag: "two" } },
+      },
+      {
+        queueId: "queue-c",
+        fn: actionWorkerTwoRef,
+        args: { value: 3 },
+        onComplete: { fn: onCompleteTwoRef, context: { tag: "three" } },
+      },
+    ]);
+
+    expect(handleMock).toHaveBeenCalledTimes(4);
+    expect(ctx.runMutation).toHaveBeenCalledWith(component.lib.enqueueBatch, {
+      items: [
+        {
+          queueId: "queue-c",
+          payload: { value: 1 },
+          handler: "handle:index.test:workerAction",
+          handlerType: "action",
+          runAfter: undefined,
+          runAt: undefined,
+          retry: undefined,
+          retryBehavior: undefined,
+          onCompleteHandler: "handle:index.test:onComplete",
+          onCompleteContext: { tag: "one" },
+        },
+        {
+          queueId: "queue-c",
+          payload: { value: 2 },
+          handler: "handle:index.test:workerAction",
+          handlerType: "action",
+          runAfter: undefined,
+          runAt: undefined,
+          retry: undefined,
+          retryBehavior: undefined,
+          onCompleteHandler: "handle:index.test:onComplete",
+          onCompleteContext: { tag: "two" },
+        },
+        {
+          queueId: "queue-c",
+          payload: { value: 3 },
+          handler: "handle:index.test:workerActionTwo",
+          handlerType: "action",
+          runAfter: undefined,
+          runAt: undefined,
+          retry: undefined,
+          retryBehavior: undefined,
+          onCompleteHandler: "handle:index.test:onCompleteTwo",
+          onCompleteContext: { tag: "three" },
         },
       ],
     });
@@ -195,7 +381,15 @@ describe("Quick client", () => {
   test("constructor defaultOrderBy is forwarded to enqueue and enqueueBatch", async () => {
     const ctx = makeCtxMock();
     const component = makeComponentApiMock();
-    const quick = new Quick(component, { defaultOrderBy: "fifo" });
+    const quick = new Quick(component, {
+      defaultOrderBy: "fifo",
+      retryByDefault: true,
+      defaultRetryBehavior: {
+        maxAttempts: 9,
+        initialBackoffMs: 15,
+        base: 4,
+      },
+    });
     const handleMock = vi.mocked(createFunctionHandle);
     handleMock.mockImplementation(
       async (fn: FunctionReference<any, any, any>) =>
@@ -221,7 +415,19 @@ describe("Quick client", () => {
       handlerType: "action",
       runAfter: undefined,
       runAt: undefined,
-      config: { defaultOrderBy: "fifo" },
+      retry: undefined,
+      retryBehavior: undefined,
+      onCompleteHandler: undefined,
+      onCompleteContext: undefined,
+      config: {
+        defaultOrderBy: "fifo",
+        retryByDefault: true,
+        defaultRetryBehavior: {
+          maxAttempts: 9,
+          initialBackoffMs: 15,
+          base: 4,
+        },
+      },
     });
 
     expect(ctx.runMutation).toHaveBeenNthCalledWith(
@@ -236,9 +442,21 @@ describe("Quick client", () => {
             handlerType: "action",
             runAfter: undefined,
             runAt: undefined,
+            retry: undefined,
+            retryBehavior: undefined,
+            onCompleteHandler: undefined,
+            onCompleteContext: undefined,
           },
         ],
-        config: { defaultOrderBy: "fifo" },
+        config: {
+          defaultOrderBy: "fifo",
+          retryByDefault: true,
+          defaultRetryBehavior: {
+            maxAttempts: 9,
+            initialBackoffMs: 15,
+            base: 4,
+          },
+        },
       },
     );
   });

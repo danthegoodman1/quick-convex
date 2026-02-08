@@ -26,6 +26,13 @@ export const markProbeExecuted = mutation({
   },
 });
 
+const completionStatusValidator = v.union(
+  v.literal("success"),
+  v.literal("failure"),
+  v.literal("cancelled"),
+);
+const onCompleteAttemptsByWorkId = new Map<string, number>();
+
 const markProbeExecutedRef = makeFunctionReference<
   "mutation",
   {
@@ -33,6 +40,66 @@ const markProbeExecutedRef = makeFunctionReference<
     via: "action" | "mutation";
   }
 >("lib.test:markProbeExecuted");
+
+export const recordOnComplete = mutation({
+  args: {
+    workId: v.string(),
+    context: v.optional(v.object({ probeId: v.id("queueItems") })),
+    status: completionStatusValidator,
+    result: v.any(),
+  },
+  returns: v.null(),
+  handler: async (ctx, args) => {
+    if (args.context?.probeId) {
+      await ctx.db.patch(args.context.probeId, {
+        payload: {
+          completion: {
+            workId: args.workId,
+            status: args.status,
+            result: args.result,
+          },
+        },
+      });
+    }
+    return null;
+  },
+});
+
+export const onCompleteTimeoutTwice = mutation({
+  args: {
+    workId: v.string(),
+    context: v.optional(v.object({ probeId: v.id("queueItems") })),
+    status: completionStatusValidator,
+    result: v.any(),
+  },
+  returns: v.null(),
+  handler: async (ctx, args) => {
+    const attempts = (onCompleteAttemptsByWorkId.get(args.workId) ?? 0) + 1;
+    onCompleteAttemptsByWorkId.set(args.workId, attempts);
+    if (attempts <= 2) {
+      throw new Error("timed out while running onComplete");
+    }
+    if (args.context?.probeId) {
+      await ctx.db.patch(args.context.probeId, {
+        payload: { attempts },
+      });
+    }
+    return null;
+  },
+});
+
+export const onCompleteAlwaysFails = mutation({
+  args: {
+    workId: v.string(),
+    context: v.optional(v.object({ probeId: v.id("queueItems") })),
+    status: completionStatusValidator,
+    result: v.any(),
+  },
+  returns: v.null(),
+  handler: async () => {
+    throw new Error("onComplete failed");
+  },
+});
 
 export const workerActionExec = action({
   args: {
@@ -90,12 +157,45 @@ const workerAlwaysFailActionRef = makeFunctionReference<
   { payload: unknown; queueId: string }
 >("lib.test:workerAlwaysFailAction");
 
+const recordOnCompleteRef = makeFunctionReference<
+  "mutation",
+  {
+    workId: string;
+    context?: { probeId: string };
+    status: "success" | "failure" | "cancelled";
+    result: any;
+  }
+>("lib.test:recordOnComplete");
+
+const onCompleteTimeoutTwiceRef = makeFunctionReference<
+  "mutation",
+  {
+    workId: string;
+    context?: { probeId: string };
+    status: "success" | "failure" | "cancelled";
+    result: any;
+  }
+>("lib.test:onCompleteTimeoutTwice");
+
+const onCompleteAlwaysFailsRef = makeFunctionReference<
+  "mutation",
+  {
+    workId: string;
+    context?: { probeId: string };
+    status: "success" | "failure" | "cancelled";
+    result: any;
+  }
+>("lib.test:onCompleteAlwaysFails");
+
 export const createWorkerHandle = mutation({
   args: {
     type: v.union(
       v.literal("actionExec"),
       v.literal("mutationExec"),
       v.literal("alwaysFailAction"),
+      v.literal("recordOnComplete"),
+      v.literal("onCompleteTimeoutTwice"),
+      v.literal("onCompleteAlwaysFails"),
     ),
   },
   returns: v.string(),
@@ -105,6 +205,15 @@ export const createWorkerHandle = mutation({
     }
     if (args.type === "mutationExec") {
       return await createFunctionHandle(workerMutationExecRef);
+    }
+    if (args.type === "recordOnComplete") {
+      return await createFunctionHandle(recordOnCompleteRef);
+    }
+    if (args.type === "onCompleteTimeoutTwice") {
+      return await createFunctionHandle(onCompleteTimeoutTwiceRef);
+    }
+    if (args.type === "onCompleteAlwaysFails") {
+      return await createFunctionHandle(onCompleteAlwaysFailsRef);
     }
     return await createFunctionHandle(workerAlwaysFailActionRef);
   },
@@ -121,6 +230,7 @@ const testApi = (
 describe("component runtime execution", () => {
   beforeEach(() => {
     vi.useFakeTimers();
+    onCompleteAttemptsByWorkId.clear();
   });
 
   afterEach(() => {
@@ -214,6 +324,360 @@ describe("component runtime execution", () => {
     expect(processed).toBeNull();
   });
 
+  test("onComplete runs after successful action worker", async () => {
+    const t = initConvexTest();
+    const completionProbeId = await t.run(async (ctx) =>
+      ctx.db.insert("queueItems", {
+        queueId: "probe-completion",
+        payload: { completion: null },
+        handler: "probe",
+        vestingTime: 0,
+        errorCount: 0,
+      }),
+    );
+
+    const [actionHandle, onCompleteHandle] = await Promise.all([
+      t.mutation(testApi.createWorkerHandle, { type: "actionExec" }),
+      t.mutation(testApi.createWorkerHandle, { type: "recordOnComplete" }),
+    ]);
+
+    const itemId = await t.run(async (ctx) =>
+      ctx.db.insert("queueItems", {
+        queueId: "queue-action-on-complete",
+        payload: { probeId: completionProbeId },
+        handler: actionHandle,
+        handlerType: "action",
+        onCompleteHandler: onCompleteHandle,
+        onCompleteContext: { probeId: completionProbeId },
+        phase: "run",
+        vestingTime: 0,
+        leaseId: "lease-action",
+        errorCount: 0,
+      }),
+    );
+
+    await t.action(internal.scanner.runWorkerAction, {
+      itemId,
+      leaseId: "lease-action",
+      handler: actionHandle,
+      handlerType: "action",
+      payload: { probeId: completionProbeId },
+      queueId: "queue-action-on-complete",
+    });
+
+    const [probe, item] = await t.run(async (ctx) =>
+      Promise.all([ctx.db.get(completionProbeId), ctx.db.get(itemId)]),
+    );
+    expect((probe?.payload as any)?.completion?.status).toBe("success");
+    expect(item).toBeNull();
+  });
+
+  test("onComplete runs after successful mutation worker", async () => {
+    const t = initConvexTest();
+    const completionProbeId = await t.run(async (ctx) =>
+      ctx.db.insert("queueItems", {
+        queueId: "probe-completion",
+        payload: { completion: null },
+        handler: "probe",
+        vestingTime: 0,
+        errorCount: 0,
+      }),
+    );
+
+    const [mutationHandle, onCompleteHandle] = await Promise.all([
+      t.mutation(testApi.createWorkerHandle, { type: "mutationExec" }),
+      t.mutation(testApi.createWorkerHandle, { type: "recordOnComplete" }),
+    ]);
+
+    const itemId = await t.run(async (ctx) =>
+      ctx.db.insert("queueItems", {
+        queueId: "queue-mutation-on-complete",
+        payload: { probeId: completionProbeId },
+        handler: mutationHandle,
+        handlerType: "mutation",
+        onCompleteHandler: onCompleteHandle,
+        onCompleteContext: { probeId: completionProbeId },
+        phase: "run",
+        vestingTime: 0,
+        leaseId: "lease-mutation",
+        errorCount: 0,
+      }),
+    );
+
+    await t.mutation(internal.scanner.runWorkerMutation, {
+      itemId,
+      leaseId: "lease-mutation",
+      handler: mutationHandle,
+      payload: { probeId: completionProbeId },
+      queueId: "queue-mutation-on-complete",
+    });
+
+    const [probe, item] = await t.run(async (ctx) =>
+      Promise.all([ctx.db.get(completionProbeId), ctx.db.get(itemId)]),
+    );
+    expect((probe?.payload as any)?.completion?.status).toBe("success");
+    expect(item).toBeNull();
+  });
+
+  test("worker retry happens before terminal failure onComplete", async () => {
+    const t = initConvexTest();
+    const queueId = "queue-retry-on-complete";
+    const completionProbeId = await t.run(async (ctx) =>
+      ctx.db.insert("queueItems", {
+        queueId: "probe-completion",
+        payload: { completion: null },
+        handler: "probe",
+        vestingTime: 0,
+        errorCount: 0,
+      }),
+    );
+
+    const [failHandle, onCompleteHandle] = await Promise.all([
+      t.mutation(testApi.createWorkerHandle, { type: "alwaysFailAction" }),
+      t.mutation(testApi.createWorkerHandle, { type: "recordOnComplete" }),
+    ]);
+
+    const itemId = await t.run(async (ctx) =>
+      ctx.db.insert("queueItems", {
+        queueId,
+        payload: { any: "value" },
+        handler: failHandle,
+        handlerType: "action",
+        onCompleteHandler: onCompleteHandle,
+        onCompleteContext: { probeId: completionProbeId },
+        phase: "run",
+        retryEnabled: true,
+        retryBehavior: {
+          maxAttempts: 2,
+          initialBackoffMs: 100,
+          base: 2,
+        },
+        vestingTime: 0,
+        errorCount: 0,
+      }),
+    );
+
+    const firstLease = await t.mutation(internal.lib.dequeue, {
+      queueId,
+      limit: 1,
+      orderBy: "vesting",
+    });
+    expect(firstLease).toHaveLength(1);
+
+    await t.action(internal.scanner.runWorkerAction, {
+      itemId,
+      leaseId: firstLease[0].leaseId,
+      handler: failHandle,
+      handlerType: "action",
+      payload: { any: "value" },
+      queueId,
+    });
+
+    const [afterFirstAttemptItem, completionAfterFirstAttempt] = await t.run(
+      async (ctx) =>
+        Promise.all([ctx.db.get(itemId), ctx.db.get(completionProbeId)]),
+    );
+    expect(afterFirstAttemptItem).not.toBeNull();
+    expect(afterFirstAttemptItem?.errorCount).toBe(1);
+    expect((completionAfterFirstAttempt?.payload as any)?.completion).toBeNull();
+
+    await t.run(async (ctx) =>
+      ctx.db.patch(itemId, {
+        vestingTime: 0,
+      }),
+    );
+
+    const secondLease = await t.mutation(internal.lib.dequeue, {
+      queueId,
+      limit: 1,
+      orderBy: "vesting",
+    });
+    expect(secondLease).toHaveLength(1);
+    expect(secondLease[0].item._id).toBe(itemId);
+
+    await t.action(internal.scanner.runWorkerAction, {
+      itemId,
+      leaseId: secondLease[0].leaseId,
+      handler: failHandle,
+      handlerType: "action",
+      payload: { any: "value" },
+      queueId,
+    });
+
+    const [afterSecondAttemptItem, completionAfterSecondAttempt] = await t.run(
+      async (ctx) =>
+        Promise.all([ctx.db.get(itemId), ctx.db.get(completionProbeId)]),
+    );
+    expect(afterSecondAttemptItem).toBeNull();
+    expect((completionAfterSecondAttempt?.payload as any)?.completion?.status).toBe(
+      "failure",
+    );
+  });
+
+  test("recovery phase skips worker execution and runs onComplete", async () => {
+    const t = initConvexTest();
+    const workerProbeId = await t.run(async (ctx) =>
+      ctx.db.insert("queueItems", {
+        queueId: "probe-worker",
+        payload: { executedBy: null },
+        handler: "probe",
+        vestingTime: 0,
+        errorCount: 0,
+      }),
+    );
+    const completionProbeId = await t.run(async (ctx) =>
+      ctx.db.insert("queueItems", {
+        queueId: "probe-completion",
+        payload: { completion: null },
+        handler: "probe",
+        vestingTime: 0,
+        errorCount: 0,
+      }),
+    );
+
+    const [actionHandle, onCompleteHandle] = await Promise.all([
+      t.mutation(testApi.createWorkerHandle, { type: "actionExec" }),
+      t.mutation(testApi.createWorkerHandle, { type: "recordOnComplete" }),
+    ]);
+
+    const itemId = await t.run(async (ctx) =>
+      ctx.db.insert("queueItems", {
+        queueId: "queue-recovery",
+        payload: { probeId: workerProbeId },
+        handler: actionHandle,
+        handlerType: "action",
+        onCompleteHandler: onCompleteHandle,
+        onCompleteContext: { probeId: completionProbeId },
+        phase: "onComplete",
+        completionStatus: "success",
+        completionResult: null,
+        vestingTime: 0,
+        leaseId: "lease-recovery",
+        errorCount: 0,
+      }),
+    );
+
+    await t.action(internal.scanner.runWorkerAction, {
+      itemId,
+      leaseId: "lease-recovery",
+      handler: actionHandle,
+      handlerType: "action",
+      payload: { probeId: workerProbeId },
+      queueId: "queue-recovery",
+    });
+
+    const [workerProbe, completionProbe, item] = await t.run(async (ctx) =>
+      Promise.all([
+        ctx.db.get(workerProbeId),
+        ctx.db.get(completionProbeId),
+        ctx.db.get(itemId),
+      ]),
+    );
+    expect(workerProbe?.payload).toEqual({ executedBy: null });
+    expect((completionProbe?.payload as any)?.completion?.status).toBe("success");
+    expect(item).toBeNull();
+  });
+
+  test("onComplete timeout retries twice before succeeding", async () => {
+    const t = initConvexTest();
+    const completionProbeId = await t.run(async (ctx) =>
+      ctx.db.insert("queueItems", {
+        queueId: "probe-timeout",
+        payload: { attempts: 0 },
+        handler: "probe",
+        vestingTime: 0,
+        errorCount: 0,
+      }),
+    );
+    const onCompleteHandle = await t.mutation(testApi.createWorkerHandle, {
+      type: "onCompleteTimeoutTwice",
+    });
+
+    const itemId = await t.run(async (ctx) =>
+      ctx.db.insert("queueItems", {
+        queueId: "queue-timeout",
+        payload: { ignored: true },
+        handler: "noop",
+        handlerType: "mutation",
+        onCompleteHandler: onCompleteHandle,
+        onCompleteContext: { probeId: completionProbeId },
+        phase: "onComplete",
+        completionStatus: "success",
+        completionResult: null,
+        vestingTime: 0,
+        leaseId: "lease-1",
+        errorCount: 0,
+      }),
+    );
+
+    await t.mutation(internal.scanner.runWorkerMutation, {
+      itemId,
+      leaseId: "lease-1",
+      handler: "noop",
+      payload: { ignored: true },
+      queueId: "queue-timeout",
+    });
+    await t.run(async (ctx) =>
+      ctx.db.patch(itemId, { leaseId: "lease-2", vestingTime: 0 }),
+    );
+    await t.mutation(internal.scanner.runWorkerMutation, {
+      itemId,
+      leaseId: "lease-2",
+      handler: "noop",
+      payload: { ignored: true },
+      queueId: "queue-timeout",
+    });
+    await t.run(async (ctx) =>
+      ctx.db.patch(itemId, { leaseId: "lease-3", vestingTime: 0 }),
+    );
+    await t.mutation(internal.scanner.runWorkerMutation, {
+      itemId,
+      leaseId: "lease-3",
+      handler: "noop",
+      payload: { ignored: true },
+      queueId: "queue-timeout",
+    });
+
+    const [probe, item] = await t.run(async (ctx) =>
+      Promise.all([ctx.db.get(completionProbeId), ctx.db.get(itemId)]),
+    );
+    expect((probe?.payload as any)?.attempts).toBe(3);
+    expect(item).toBeNull();
+  });
+
+  test("terminal onComplete failure deletes item", async () => {
+    const t = initConvexTest();
+    const onCompleteHandle = await t.mutation(testApi.createWorkerHandle, {
+      type: "onCompleteAlwaysFails",
+    });
+    const itemId = await t.run(async (ctx) =>
+      ctx.db.insert("queueItems", {
+        queueId: "queue-on-complete-fail",
+        payload: { ignored: true },
+        handler: "noop",
+        handlerType: "mutation",
+        onCompleteHandler: onCompleteHandle,
+        phase: "onComplete",
+        completionStatus: "success",
+        completionResult: null,
+        vestingTime: 0,
+        leaseId: "lease-fail",
+        errorCount: 0,
+      }),
+    );
+
+    await t.mutation(internal.scanner.runWorkerMutation, {
+      itemId,
+      leaseId: "lease-fail",
+      handler: "noop",
+      payload: { ignored: true },
+      queueId: "queue-on-complete-fail",
+    });
+
+    const item = await t.run(async (ctx) => ctx.db.get(itemId));
+    expect(item).toBeNull();
+  });
+
   test("vesting order allows later ready item after head fails and is delayed", async () => {
     const t = initConvexTest();
     const queueId = "queue-vesting";
@@ -304,6 +768,12 @@ describe("component runtime execution", () => {
         payload: { tag: "first" },
         handler: failHandle,
         handlerType: "action",
+        retryEnabled: true,
+        retryBehavior: {
+          maxAttempts: 2,
+          initialBackoffMs: 60_000,
+          base: 2,
+        },
         vestingTime: 0,
         errorCount: 0,
       });
@@ -312,6 +782,12 @@ describe("component runtime execution", () => {
         payload: { tag: "second" },
         handler: failHandle,
         handlerType: "action",
+        retryEnabled: true,
+        retryBehavior: {
+          maxAttempts: 2,
+          initialBackoffMs: 60_000,
+          base: 2,
+        },
         vestingTime: 0,
         errorCount: 0,
       });

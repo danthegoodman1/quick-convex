@@ -8,7 +8,7 @@ import {
 } from "./_generated/server.js"
 import { internal } from "./_generated/api.js"
 import type { Id } from "./_generated/dataModel.js"
-import { resolveConfig } from "./lib.js"
+import { getRetryDelayMs, isTimeoutError, resolveConfig } from "./lib.js"
 
 const POINTER_OVERSCAN_MULTIPLIER = 5
 
@@ -343,14 +343,22 @@ export const runManager = internalAction({
 
     await Promise.all(
       items.map((item) =>
-        ctx.scheduler.runAfter(0, internal.scanner.runWorker, {
-          itemId: item.item._id,
-          leaseId: item.leaseId,
-          handler: item.item.handler,
-          handlerType: item.item.handlerType ?? "action",
-          payload: item.item.payload,
-          queueId: args.queueId,
-        })
+        (item.item.handlerType ?? "action") === "mutation"
+          ? ctx.scheduler.runAfter(0, internal.scanner.runWorkerMutation, {
+              itemId: item.item._id,
+              leaseId: item.leaseId,
+              handler: item.item.handler,
+              payload: item.item.payload,
+              queueId: args.queueId,
+            })
+          : ctx.scheduler.runAfter(0, internal.scanner.runWorkerAction, {
+              itemId: item.item._id,
+              leaseId: item.leaseId,
+              handler: item.item.handler,
+              handlerType: item.item.handlerType ?? "action",
+              payload: item.item.payload,
+              queueId: args.queueId,
+            })
       )
     )
 
@@ -443,7 +451,7 @@ export const finalizePointer = internalMutation({
   },
 })
 
-export const runWorker = internalAction({
+export const runWorkerAction = internalAction({
   args: {
     itemId: v.id("queueItems"),
     leaseId: v.string(),
@@ -453,6 +461,23 @@ export const runWorker = internalAction({
     queueId: v.string(),
   },
   handler: async (ctx, args) => {
+    const preflight = await ctx.runMutation(internal.lib.prepareActionWorkerExecution, {
+      itemId: args.itemId,
+      leaseId: args.leaseId,
+    })
+
+    if (!preflight.valid) {
+      return
+    }
+
+    if (preflight.phase === "onComplete") {
+      await ctx.runMutation(internal.lib.finalizeActionWorker, {
+        itemId: args.itemId,
+        leaseId: args.leaseId,
+      })
+      return
+    }
+
     const config = await ctx.runQuery(internal.lib.getResolvedConfig, {})
     const extendIntervalMs = Math.max(
       100,
@@ -494,30 +519,21 @@ export const runWorker = internalAction({
     }
 
     const extendPromise = extendLeaseLoop()
-    let handlerError: unknown | null = null
+    let status: "success" | "failure" = "success"
+    let result: unknown = null
 
     try {
-      if (args.handlerType === "mutation") {
-        const fnHandle = args.handler as FunctionHandle<
-          "mutation",
-          { payload: unknown; queueId: string }
-        >
-        await ctx.runMutation(fnHandle, {
-          payload: args.payload,
-          queueId: args.queueId,
-        })
-      } else {
-        const fnHandle = args.handler as FunctionHandle<
-          "action",
-          { payload: unknown; queueId: string }
-        >
-        await ctx.runAction(fnHandle, {
-          payload: args.payload,
-          queueId: args.queueId,
-        })
-      }
+      const fnHandle = args.handler as FunctionHandle<
+        "action",
+        { payload: unknown; queueId: string }
+      >
+      result = await ctx.runAction(fnHandle, {
+        payload: args.payload,
+        queueId: args.queueId,
+      })
     } catch (error) {
-      handlerError = error
+      status = "failure"
+      result = error instanceof Error ? error.message : String(error)
     }
 
     stop = true
@@ -528,22 +544,167 @@ export const runWorker = internalAction({
       return
     }
 
-    if (handlerError === null) {
-      await ctx.runMutation(internal.lib.complete, {
+    await ctx.runMutation(internal.lib.finalizeActionWorker, {
+      itemId: args.itemId,
+      leaseId: args.leaseId,
+      status,
+      result,
+    })
+  },
+})
+
+async function schedulePointerWakeIfEarlier(
+  ctx: MutationCtx,
+  queueId: string,
+  vestingTime: number
+) {
+  const pointer = await ctx.db
+    .query("queuePointers")
+    .withIndex("by_queue", (q) => q.eq("queueId", queueId))
+    .unique()
+  if (pointer && vestingTime < pointer.vestingTime) {
+    await ctx.scheduler.runAfter(0, internal.lib.updatePointerVesting, {
+      queueId,
+      vestingTime,
+    })
+  }
+}
+
+export const runWorkerMutation = internalMutation({
+  args: {
+    itemId: v.id("queueItems"),
+    leaseId: v.string(),
+    handler: v.string(),
+    payload: v.any(),
+    queueId: v.string(),
+  },
+  returns: v.null(),
+  handler: async (ctx, args) => {
+    const config = await resolveConfig(ctx)
+    let item = await ctx.db.get(args.itemId)
+    if (!item || item.leaseId !== args.leaseId) {
+      return null
+    }
+
+    if ((item.phase ?? "run") === "run") {
+      let status: "success" | "failure" = "success"
+      let result: unknown = null
+
+      try {
+        const fnHandle = args.handler as FunctionHandle<
+          "mutation",
+          { payload: unknown; queueId: string }
+        >
+        result = await ctx.runMutation(fnHandle, {
+          payload: args.payload,
+          queueId: args.queueId,
+        })
+      } catch (error) {
+        status = "failure"
+        result = error instanceof Error ? error.message : String(error)
+      }
+
+      if (status === "failure") {
+        const retryEnabled = item.retryEnabled ?? false
+        const retryBehavior = item.retryBehavior ?? config.defaultRetryBehavior
+        const nextErrorCount = item.errorCount + 1
+        const maxAttempts = Math.max(1, retryBehavior.maxAttempts)
+
+        if (retryEnabled && nextErrorCount < maxAttempts) {
+          const backoffMs = getRetryDelayMs(retryBehavior, nextErrorCount)
+          const retryVestingTime = Date.now() + backoffMs
+          await ctx.db.patch(item._id, {
+            errorCount: nextErrorCount,
+            vestingTime: retryVestingTime,
+            leaseId: undefined,
+            leaseExpiry: undefined,
+          })
+          await schedulePointerWakeIfEarlier(ctx, item.queueId, retryVestingTime)
+          return null
+        }
+      }
+
+      await ctx.db.patch(item._id, {
+        phase: "onComplete",
+        completionStatus: status,
+        completionResult: result,
+      })
+
+      item = await ctx.db.get(item._id)
+      if (!item || item.leaseId !== args.leaseId) {
+        return null
+      }
+    }
+
+    if (!item.onCompleteHandler) {
+      await ctx.db.delete(item._id)
+      return null
+    }
+
+    try {
+      const onCompleteHandle = item.onCompleteHandler as FunctionHandle<
+        "mutation",
+        {
+          workId: string
+          context?: unknown
+          status: "success" | "failure" | "cancelled"
+          result: unknown
+        }
+      >
+      await ctx.runMutation(onCompleteHandle, {
+        workId: item._id,
+        context: item.onCompleteContext,
+        status: (item.completionStatus ?? "failure") as
+          | "success"
+          | "failure"
+          | "cancelled",
+        result: item.completionResult,
+      })
+      await ctx.db.delete(item._id)
+      return null
+    } catch (error) {
+      const timeoutRetries = item.onCompleteTimeoutRetries ?? 0
+      if (isTimeoutError(error) && timeoutRetries < 2) {
+        const retryVestingTime = Date.now() + config.scannerBackoffMinMs
+        await ctx.db.patch(item._id, {
+          onCompleteTimeoutRetries: timeoutRetries + 1,
+          vestingTime: retryVestingTime,
+          leaseId: undefined,
+          leaseExpiry: undefined,
+        })
+        await schedulePointerWakeIfEarlier(ctx, item.queueId, retryVestingTime)
+        return null
+      }
+
+      console.error("[quick] onComplete terminal failure", error)
+      await ctx.db.delete(item._id)
+      return null
+    }
+  },
+})
+
+// Backwards compatibility for internal callers still pointing at runWorker.
+export const runWorker = internalAction({
+  args: {
+    itemId: v.id("queueItems"),
+    leaseId: v.string(),
+    handler: v.string(),
+    handlerType: v.union(v.literal("action"), v.literal("mutation")),
+    payload: v.any(),
+    queueId: v.string(),
+  },
+  handler: async (ctx, args) => {
+    if (args.handlerType === "mutation") {
+      await ctx.runMutation(internal.scanner.runWorkerMutation, {
         itemId: args.itemId,
         leaseId: args.leaseId,
+        handler: args.handler,
+        payload: args.payload,
+        queueId: args.queueId,
       })
       return
     }
-
-    const errorMessage =
-      handlerError instanceof Error ? handlerError.message : String(handlerError)
-
-    await ctx.runMutation(internal.lib.requeue, {
-      itemId: args.itemId,
-      leaseId: args.leaseId,
-      error: errorMessage,
-    })
+    await ctx.runAction(internal.scanner.runWorkerAction, args)
   },
 })
 
