@@ -10,6 +10,8 @@ import { internal } from "./_generated/api.js"
 import type { Id } from "./_generated/dataModel.js"
 import { resolveConfig } from "./lib.js"
 
+const POINTER_OVERSCAN_MULTIPLIER = 5
+
 async function wakeScanner(
   ctx: MutationCtx,
   opts: {
@@ -67,6 +69,8 @@ export const claimScannerLease = internalMutation({
   },
   returns: v.object({
     valid: v.boolean(),
+    hasDuePointers: v.boolean(),
+    nextPointerVestingTime: v.union(v.null(), v.number()),
     pointers: v.array(
       v.object({
         pointerId: v.id("queuePointers"),
@@ -82,11 +86,21 @@ export const claimScannerLease = internalMutation({
     const state = await ctx.db.query("scannerState").first()
 
     if (!state || state.leaseId !== args.leaseId) {
-      return { valid: false, pointers: [] }
+      return {
+        valid: false,
+        hasDuePointers: false,
+        nextPointerVestingTime: null,
+        pointers: [],
+      }
     }
 
     if (state.leaseExpiry && state.leaseExpiry < now) {
-      return { valid: false, pointers: [] }
+      return {
+        valid: false,
+        hasDuePointers: false,
+        nextPointerVestingTime: null,
+        pointers: [],
+      }
     }
 
     await ctx.db.patch(state._id, {
@@ -94,22 +108,54 @@ export const claimScannerLease = internalMutation({
       lastRunAt: now,
     })
 
-    const pointers = await ctx.db
-      .query("queuePointers")
-      .withIndex("by_vesting", (q) => q.lte("vestingTime", now))
-      .take(config.pointerBatchSize)
+    const duePointersQuery = () =>
+      ctx.db.query("queuePointers").withIndex("by_vesting", (q) => q.lte("vestingTime", now))
+    const hasDuePointers = (await duePointersQuery().first()) !== null
 
-    const availablePointers = pointers.filter(
-      (p) => !p.leaseExpiry || p.leaseExpiry <= now
-    )
+    const nextPointer = await ctx.db
+      .query("queuePointers")
+      .withIndex("by_vesting")
+      .first()
+
+    const availablePointers: Array<{
+      _id: Id<"queuePointers">
+      queueId: string
+    }> = []
+    const maxPointersToScan =
+      Math.max(config.pointerBatchSize, config.maxConcurrentManagers) *
+      POINTER_OVERSCAN_MULTIPLIER
+    let scannedPointers = 0
+
+    for await (const pointer of duePointersQuery()) {
+      scannedPointers++
+
+      if (pointer.leaseExpiry && pointer.leaseExpiry > now) {
+        if (scannedPointers >= maxPointersToScan) {
+          break
+        }
+        continue
+      }
+
+      availablePointers.push({
+        _id: pointer._id,
+        queueId: pointer.queueId,
+      })
+
+      if (availablePointers.length >= config.maxConcurrentManagers) {
+        break
+      }
+      if (scannedPointers >= maxPointersToScan) {
+        break
+      }
+    }
 
     const claimedPointers: Array<{
-      pointerId: typeof availablePointers[0]["_id"]
+      pointerId: Id<"queuePointers">
       queueId: string
       pointerLeaseId: string
     }> = []
 
-    for (const pointer of availablePointers.slice(0, config.maxConcurrentManagers)) {
+    for (const pointer of availablePointers) {
       const pointerLeaseId = uuid()
       const pointerLeaseExpiry = now + config.scannerLeaseDurationMs
 
@@ -126,7 +172,12 @@ export const claimScannerLease = internalMutation({
       })
     }
 
-    return { valid: true, pointers: claimedPointers }
+    return {
+      valid: true,
+      hasDuePointers,
+      nextPointerVestingTime: nextPointer?.vestingTime ?? null,
+      pointers: claimedPointers,
+    }
   },
 })
 
@@ -144,10 +195,17 @@ export const runScanner = internalAction({
     }
 
     if (result.pointers.length === 0) {
-      await ctx.runMutation(internal.scanner.rescheduleScanner, {
-        leaseId: args.leaseId,
-        hasWork: false,
-      })
+      if (result.hasDuePointers) {
+        await ctx.runMutation(internal.scanner.rescheduleScanner, {
+          leaseId: args.leaseId,
+          hasWork: true,
+        })
+      } else {
+        await ctx.runMutation(internal.scanner.parkScanner, {
+          leaseId: args.leaseId,
+          nextPointerVestingTime: result.nextPointerVestingTime ?? undefined,
+        })
+      }
       return
     }
 
@@ -165,6 +223,48 @@ export const runScanner = internalAction({
       leaseId: args.leaseId,
       hasWork: true,
     })
+  },
+})
+
+export const parkScanner = internalMutation({
+  args: {
+    leaseId: v.string(),
+    nextPointerVestingTime: v.optional(v.number()),
+  },
+  returns: v.null(),
+  handler: async (ctx, args) => {
+    const now = Date.now()
+    const state = await ctx.db.query("scannerState").first()
+
+    if (!state || state.leaseId !== args.leaseId) {
+      return null
+    }
+
+    if (args.nextPointerVestingTime === undefined) {
+      await ctx.db.patch(state._id, {
+        leaseId: undefined,
+        leaseExpiry: undefined,
+        scheduledFunctionId: undefined,
+        lastRunAt: now,
+      })
+      return null
+    }
+
+    const delayMs = Math.max(0, args.nextPointerVestingTime - now)
+    const scheduledId = await ctx.scheduler.runAfter(
+      delayMs,
+      internal.scanner.watchdogRecoverScanner,
+      {}
+    )
+
+    await ctx.db.patch(state._id, {
+      leaseId: undefined,
+      leaseExpiry: undefined,
+      scheduledFunctionId: scheduledId,
+      lastRunAt: now,
+    })
+
+    return null
   },
 })
 

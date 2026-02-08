@@ -145,6 +145,7 @@ export const updatePointerVesting = internalMutation({
         vestingTime: args.vestingTime,
         lastActiveTime: now,
       })
+      await ctx.scheduler.runAfter(0, internal.scanner.tryWakeScanner, {})
     }
 
     return null
@@ -181,19 +182,18 @@ export const enqueue = mutation({
       .unique()
 
     if (existingPointer) {
-      await ctx.scheduler.runAfter(0, internal.lib.updatePointerVesting, {
-        queueId: args.queueId,
-        vestingTime,
-      })
+      if (vestingTime < existingPointer.vestingTime) {
+        await ctx.scheduler.runAfter(0, internal.lib.updatePointerVesting, {
+          queueId: args.queueId,
+          vestingTime,
+        })
+      }
     } else {
       await ctx.db.insert("queuePointers", {
         queueId: args.queueId,
         vestingTime,
         lastActiveTime: now,
       })
-    }
-
-    if (vestingTime <= now) {
       await ctx.scheduler.runAfter(0, internal.scanner.tryWakeScanner, {})
     }
 
@@ -251,24 +251,20 @@ export const enqueueBatch = mutation({
         .unique()
 
       if (existingPointer) {
-        await ctx.scheduler.runAfter(0, internal.lib.updatePointerVesting, {
-          queueId,
-          vestingTime: update.vestingTime,
-        })
+        if (update.vestingTime < existingPointer.vestingTime) {
+          await ctx.scheduler.runAfter(0, internal.lib.updatePointerVesting, {
+            queueId,
+            vestingTime: update.vestingTime,
+          })
+        }
       } else {
         await ctx.db.insert("queuePointers", {
           queueId,
           vestingTime: update.vestingTime,
           lastActiveTime: update.lastActiveTime,
         })
+        await ctx.scheduler.runAfter(0, internal.scanner.tryWakeScanner, {})
       }
-    }
-
-    const hasImmediateWork = Array.from(pointerUpdates.values()).some(
-      (update) => update.vestingTime <= now
-    )
-    if (hasImmediateWork) {
-      await ctx.scheduler.runAfter(0, internal.scanner.tryWakeScanner, {})
     }
 
     return itemIds as any
@@ -357,10 +353,16 @@ async function collectAvailableItems(
     }
 
     if (item.vestingTime > args.now) {
-      continue
+      // For vesting order, all later rows are also in the future.
+      // For FIFO, strict head-of-line semantics block on the first future row.
+      break
     }
 
     if (item.leaseExpiry && item.leaseExpiry > args.now) {
+      if (args.orderBy === "fifo") {
+        // Strict FIFO: do not skip a leased head item.
+        break
+      }
       continue
     }
 
@@ -611,6 +613,7 @@ export const requeue = internalMutation({
         vestingTime,
         lastActiveTime: now,
       })
+      await ctx.scheduler.runAfter(0, internal.scanner.tryWakeScanner, {})
     }
 
     return true
@@ -794,6 +797,7 @@ export const replayDeadLetter = mutation({
           vestingTime,
           lastActiveTime: now,
         })
+        await ctx.scheduler.runAfter(0, internal.scanner.tryWakeScanner, {})
       } else {
         await ctx.db.patch(existingPointer._id, {
           lastActiveTime: now,
@@ -805,6 +809,7 @@ export const replayDeadLetter = mutation({
         vestingTime,
         lastActiveTime: now,
       })
+      await ctx.scheduler.runAfter(0, internal.scanner.tryWakeScanner, {})
     }
 
     await ctx.db.delete(args.deadLetterId)

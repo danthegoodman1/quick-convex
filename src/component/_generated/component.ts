@@ -30,7 +30,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
         {
           config?: {
             defaultLeaseDurationMs?: number;
-            defaultPriority?: number;
+            defaultOrderBy?: "vesting" | "fifo";
             maxConcurrentManagers?: number;
             maxRetries?: number;
             minInactiveBeforeDeleteMs?: number;
@@ -42,7 +42,6 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
           delayMs?: number;
           handler: string;
           payload: any;
-          priority?: number;
           queueId: string;
         },
         string,
@@ -54,7 +53,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
         {
           config?: {
             defaultLeaseDurationMs?: number;
-            defaultPriority?: number;
+            defaultOrderBy?: "vesting" | "fifo";
             maxConcurrentManagers?: number;
             maxRetries?: number;
             minInactiveBeforeDeleteMs?: number;
@@ -67,7 +66,6 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
             delayMs?: number;
             handler: string;
             payload: any;
-            priority?: number;
             queueId: string;
           }>;
         },
@@ -105,7 +103,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
       replayDeadLetter: FunctionReference<
         "mutation",
         "internal",
-        { deadLetterId: string; delayMs?: number; priority?: number },
+        { deadLetterId: string; delayMs?: number },
         null | string,
         Name
       >;
