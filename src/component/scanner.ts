@@ -8,7 +8,7 @@ import {
 } from "./_generated/server.js"
 import { internal } from "./_generated/api.js"
 import type { Id } from "./_generated/dataModel.js"
-import { resolveConfig } from "./lib.js"
+import { resolveConfig, type QueueOrder } from "./lib.js"
 
 const POINTER_OVERSCAN_MULTIPLIER = 5
 
@@ -69,6 +69,7 @@ export const claimScannerLease = internalMutation({
   },
   returns: v.object({
     valid: v.boolean(),
+    orderBy: v.union(v.literal("vesting"), v.literal("fifo")),
     hasDuePointers: v.boolean(),
     nextPointerVestingTime: v.union(v.null(), v.number()),
     pointers: v.array(
@@ -88,6 +89,7 @@ export const claimScannerLease = internalMutation({
     if (!state || state.leaseId !== args.leaseId) {
       return {
         valid: false,
+        orderBy: config.defaultOrderBy,
         hasDuePointers: false,
         nextPointerVestingTime: null,
         pointers: [],
@@ -97,6 +99,7 @@ export const claimScannerLease = internalMutation({
     if (state.leaseExpiry && state.leaseExpiry < now) {
       return {
         valid: false,
+        orderBy: config.defaultOrderBy,
         hasDuePointers: false,
         nextPointerVestingTime: null,
         pointers: [],
@@ -174,6 +177,7 @@ export const claimScannerLease = internalMutation({
 
     return {
       valid: true,
+      orderBy: config.defaultOrderBy,
       hasDuePointers,
       nextPointerVestingTime: nextPointer?.vestingTime ?? null,
       pointers: claimedPointers,
@@ -215,6 +219,7 @@ export const runScanner = internalAction({
           pointerId: pointer.pointerId,
           queueId: pointer.queueId,
           pointerLeaseId: pointer.pointerLeaseId,
+          orderBy: result.orderBy,
         })
       )
     )
@@ -312,11 +317,13 @@ export const runManager = internalAction({
     pointerId: v.id("queuePointers"),
     queueId: v.string(),
     pointerLeaseId: v.string(),
+    orderBy: v.union(v.literal("vesting"), v.literal("fifo")),
   },
   handler: async (ctx, args) => {
     const items = await ctx.runMutation(internal.lib.dequeue, {
       queueId: args.queueId,
       limit: 10,
+      orderBy: args.orderBy,
     })
 
     if (items.length === 0) {
@@ -324,6 +331,7 @@ export const runManager = internalAction({
         pointerId: args.pointerId,
         pointerLeaseId: args.pointerLeaseId,
         isEmpty: true,
+        orderBy: args.orderBy,
       })
       return
     }
@@ -345,6 +353,7 @@ export const runManager = internalAction({
       pointerId: args.pointerId,
       pointerLeaseId: args.pointerLeaseId,
       isEmpty: false,
+      orderBy: args.orderBy,
     })
   },
 })
@@ -354,6 +363,7 @@ export const finalizePointer = internalMutation({
     pointerId: v.id("queuePointers"),
     pointerLeaseId: v.string(),
     isEmpty: v.boolean(),
+    orderBy: v.union(v.literal("vesting"), v.literal("fifo")),
   },
   returns: v.null(),
   handler: async (ctx, args) => {
@@ -368,12 +378,18 @@ export const finalizePointer = internalMutation({
       return null
     }
 
-    const nextItem = await ctx.db
-      .query("queueItems")
-      .withIndex("by_queue_and_vesting_time", (q) =>
-        q.eq("queueId", pointer.queueId)
-      )
-      .first()
+    const nextItem =
+      args.orderBy === "fifo"
+        ? await ctx.db
+            .query("queueItems")
+            .withIndex("by_queue_fifo", (q) => q.eq("queueId", pointer.queueId))
+            .first()
+        : await ctx.db
+            .query("queueItems")
+            .withIndex("by_queue_and_vesting_time", (q) =>
+              q.eq("queueId", pointer.queueId)
+            )
+            .first()
 
     const nextVestingTime = nextItem
       ? Math.max(now, nextItem.vestingTime)

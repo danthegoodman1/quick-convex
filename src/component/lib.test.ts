@@ -342,4 +342,49 @@ describe("component runtime execution", () => {
     });
     expect(secondLease).toHaveLength(0);
   });
+
+  test("finalizePointer uses FIFO head for next vesting", async () => {
+    const t = initConvexTest();
+    const queueId = "queue-fifo-pointer";
+    const now = Date.now();
+    const delayedHeadVesting = now + 60_000;
+
+    const pointerId = await t.run(async (ctx) => {
+      await ctx.db.insert("queueItems", {
+        queueId,
+        payload: { tag: "head-delayed" },
+        handler: "h1",
+        handlerType: "action",
+        vestingTime: delayedHeadVesting,
+        errorCount: 0,
+      });
+      await ctx.db.insert("queueItems", {
+        queueId,
+        payload: { tag: "later-ready" },
+        handler: "h2",
+        handlerType: "action",
+        vestingTime: now - 1_000,
+        errorCount: 0,
+      });
+
+      return await ctx.db.insert("queuePointers", {
+        queueId,
+        vestingTime: now,
+        leaseId: "pointer-lease",
+        leaseExpiry: now + 30_000,
+        lastActiveTime: now,
+      });
+    });
+
+    await t.mutation(internal.scanner.finalizePointer, {
+      pointerId,
+      pointerLeaseId: "pointer-lease",
+      isEmpty: true,
+      orderBy: "fifo",
+    });
+
+    const pointer = await t.run(async (ctx) => ctx.db.get(pointerId));
+    expect(pointer).not.toBeNull();
+    expect(pointer?.vestingTime).toBe(delayedHeadVesting);
+  });
 });
