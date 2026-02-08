@@ -8,17 +8,18 @@ function App() {
   const [text, setText] = useState("Process this comment");
   const [randomizeQueueId, setRandomizeQueueId] = useState(false);
   const [statsQueueId, setStatsQueueId] = useState("blog-post-1");
+  const currentStatsQueueId = randomizeQueueId ? statsQueueId : queueId;
 
   const enqueueAction = useMutation(api.example.enqueueCommentAction);
   const enqueueMutation = useMutation(api.example.enqueueCommentMutation);
   const enqueueBatchVesting = useMutation(api.example.enqueueCommentBatchActionVesting);
   const enqueueBatchFifo = useMutation(api.example.enqueueCommentBatchActionFifo);
   const vestingStats = useQuery(api.example.queueStats, {
-    targetId: statsQueueId,
+    targetId: currentStatsQueueId,
     mode: "vesting",
   });
   const fifoStats = useQuery(api.example.queueStats, {
-    targetId: statsQueueId,
+    targetId: currentStatsQueueId,
     mode: "fifo",
   });
 
@@ -59,12 +60,6 @@ function App() {
     setStatsQueueId(targetId);
     void enqueueBatchFifo({ targetId });
   }, [enqueueBatchFifo, resolveTargetId]);
-
-  useEffect(() => {
-    if (!randomizeQueueId) {
-      setStatsQueueId(queueId);
-    }
-  }, [queueId, randomizeQueueId]);
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -172,7 +167,7 @@ function App() {
           }}
         >
           <div style={{ gridColumn: "1 / -1", textAlign: "left" }}>
-            <strong>Stats Queue ID:</strong> <code>{statsQueueId}</code>
+            <strong>Stats Queue ID:</strong> <code>{currentStatsQueueId}</code>
           </div>
           <div>
             <strong>Vesting Stats</strong>

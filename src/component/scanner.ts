@@ -8,7 +8,7 @@ import {
 } from "./_generated/server.js"
 import { internal } from "./_generated/api.js"
 import type { Id } from "./_generated/dataModel.js"
-import { resolveConfig, type QueueOrder } from "./lib.js"
+import { resolveConfig } from "./lib.js"
 
 const POINTER_OVERSCAN_MULTIPLIER = 5
 
