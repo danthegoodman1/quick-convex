@@ -129,6 +129,7 @@ Quick is heavily inspired by Convex Workpools and the QuiCK paper. Workpools are
 - Officially maintained by the Convex team.
 - Operationally simpler in many common setups.
 - Production proven at scale in Convex
+- More aggressive about cleanup (less noise/waste for low-resource projects)
 
 ### Workpools edge case to be aware of
 
