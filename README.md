@@ -128,6 +128,7 @@ Quick is heavily inspired by Convex Workpools and the QuiCK paper. Workpools are
 - Slightly lighter weight runtime model.
 - Officially maintained by the Convex team.
 - Operationally simpler in many common setups.
+- Production proven at scale in Convex
 
 ### Workpools edge case to be aware of
 
@@ -139,6 +140,7 @@ Quick is heavily inspired by Convex Workpools and the QuiCK paper. Workpools are
 - Multiple ordering modes, especially strict per-domain FIFO via `queueId`.
 - FIFO is much easier to model than emulating ordering via many `maxParallelism: 1` workpools.
 - Faster and lower contention ramp from idle to heavy load.
+- QuiCK model proven at scale at Apple (but not this implementation!)
 
 ### Tradeoff to keep in mind
 
