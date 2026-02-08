@@ -1,100 +1,8 @@
 # QuiCK Convex
 
-A [QuiCK](https://www.foundationdb.org/files/QuiCK.pdf) implementation as a Convex component.
-
-## Differences from QuiCK
-
-**Ordering:** Within a queue zone, you are able to order by insertion time, or by vesting time. This is useful if you would like in-order processing on some partition key (e.g. per-user).
-
-**Recovery:** Because Convex does not have the concept of looping code (at least, not efficiently), we instead optimistically check whether the scanner needs to run on every enqueue. The scanner will re-enqueue itself if there's more work to do. In the event the scanner (or Convex) crashes, there's a 1 minute watchdog cron interval that will wake the scanner if it's not already working.
-
----
-
-# Convex Component Template
-
-This is a Convex component, ready to be published on npm.
-
-To create your own component:
-
-1. Write code in src/component for your component. Component-specific tables,
-   queries, mutations, and actions go here.
-1. Write code in src/client for the Class that interfaces with the component.
-   This is the bridge your users will access to get information into and out of
-   your component
-1. Write example usage in example/convex/example.ts.
-1. Delete the text in this readme until `---` and flesh out the README.
-1. Publish to npm with `npm run alpha` or `npm run release`.
-
-To develop your component run a dev process in the example project:
-
-```sh
-npm i
-npm run dev
-```
-
-`npm i` will do the install and an initial build. `npm run dev` will start a
-file watcher to re-build the component, as well as the example project frontend
-and backend, which does codegen and installs the component.
-
-Modify the schema and index files in src/component/ to define your component.
-
-Write a client for using this component in src/client/index.ts.
-
-If you won't be adding frontend code (e.g. React components) to this component
-you can delete "./react" references in package.json and "src/react/" directory.
-If you will be adding frontend code, add a peer dependency on React in
-package.json.
-
-### Component Directory structure
-
-```
-.
-├── README.md           documentation of your component
-├── package.json        component name, version number, other metadata
-├── package-lock.json   Components are like libraries, package-lock.json
-│                       is .gitignored and ignored by consumers.
-├── src
-│   ├── component/
-│   │   ├── _generated/ Files here are generated for the component.
-│   │   ├── convex.config.ts  Name your component here and use other components
-│   │   ├── lib.ts    Define functions here and in new files in this directory
-│   │   └── schema.ts   schema specific to this component
-│   ├── client/
-│   │   └── index.ts    Code that needs to run in the app that uses the
-│   │                   component. Generally the app interacts directly with
-│   │                   the component's exposed API (src/component/*).
-│   └── react/          Code intended to be used on the frontend goes here.
-│       │               Your are free to delete this if this component
-│       │               does not provide code.
-│       └── index.ts
-├── example/            example Convex app that uses this component
-│   └── convex/
-│       ├── _generated/       Files here are generated for the example app.
-│       ├── convex.config.ts  Imports and uses this component
-│       ├── myFunctions.ts    Functions that use the component
-│       └── schema.ts         Example app schema
-└── dist/               Publishing artifacts will be created here.
-```
-
----
-
-# Convex Quick Convex
-
-[![npm version](https://badge.fury.io/js/@example%2Fquick-convex.svg)](https://badge.fury.io/js/@example%2Fquick-convex)
-
-<!-- START: Include on https://convex.dev/components -->
-
-- [ ] What is some compelling syntax as a hook?
-- [ ] Why should you use this component?
-- [ ] Links to docs / other resources?
-
-Found a bug? Feature request?
-[File it here](https://github.com/danthegoodman1/quick-convex/issues).
+A [QuiCK](https://www.foundationdb.org/files/QuiCK.pdf)-style queue implementation as a Convex component.
 
 ## Installation
-
-Create a `convex.config.ts` file in your app's `convex/` folder and install the
-component by calling `use`:
 
 ```ts
 // convex/convex.config.ts
@@ -107,52 +15,96 @@ app.use(quickConvex);
 export default app;
 ```
 
-## Usage
+## Quick Class API
+
+Use the class API for enqueueing work:
 
 ```ts
-import { components } from "./_generated/api";
+import { Quick } from "@danthegoodman/quick-convex";
+import { components, api } from "./_generated/api";
 
-export const addComment = mutation({
-  args: { text: v.string(), targetId: v.string() },
+const quick = new Quick(components.quickConvex);
+```
+
+### Worker function contract
+
+Workers must accept this argument shape:
+
+```ts
+{
+  payload: TPayload;
+  queueId: string;
+}
+```
+
+This applies to both action and mutation workers.
+
+### Enqueue action worker
+
+```ts
+export const enqueueEmail = mutation({
+  args: { userId: v.string() },
   handler: async (ctx, args) => {
-    return await ctx.runMutation(components.quickConvex.lib.add, {
-      text: args.text,
-      targetId: args.targetId,
-      userId: await getAuthUserId(ctx),
+    return await quick.enqueueAction(ctx, {
+      queueId: args.userId,
+      fn: api.jobs.sendEmailWorker,
+      args: { userId: args.userId },
+      delayMs: 5_000,
     });
   },
 });
 ```
 
-See more example usage in [example.ts](./example/convex/example.ts).
-
-### HTTP Routes
-
-You can register HTTP routes for the component to expose HTTP endpoints:
+### Enqueue mutation worker
 
 ```ts
-import { httpRouter } from "convex/server";
-import { registerRoutes } from "@danthegoodman/quick-convex";
-import { components } from "./_generated/api";
-
-const http = httpRouter();
-
-registerRoutes(http, components.quickConvex, {
-  pathPrefix: "/comments",
+export const enqueueMutationWorker = mutation({
+  args: { userId: v.string() },
+  handler: async (ctx, args) => {
+    return await quick.enqueueMutation(ctx, {
+      queueId: args.userId,
+      fn: api.jobs.processUserMutationWorker,
+      args: { userId: args.userId },
+    });
+  },
 });
-
-export default http;
 ```
 
-This will expose a GET endpoint that returns the most recent comment as JSON.
-The endpoint requires a `targetId` query parameter. See
-[http.ts](./example/convex/http.ts) for a complete example.
+### Batch enqueue (multi-function)
 
-<!-- END: Include on https://convex.dev/components -->
+`enqueueBatchAction` and `enqueueBatchMutation` accept per-item function refs and dedupe handle creation per unique function in the batch.
 
-Run the example:
-
-```sh
-npm i
-npm run dev
+```ts
+export const enqueueBatch = mutation({
+  args: { queueId: v.string() },
+  handler: async (ctx, args) => {
+    return await quick.enqueueBatchAction(ctx, [
+      {
+        queueId: args.queueId,
+        fn: api.jobs.workerA,
+        args: { value: 1 },
+      },
+      {
+        queueId: args.queueId,
+        fn: api.jobs.workerA,
+        args: { value: 2 },
+      },
+      {
+        queueId: args.queueId,
+        fn: api.jobs.workerB,
+        args: { value: 3 },
+      },
+    ]);
+  },
+});
 ```
+
+## Queue behavior
+
+- Supports `"vesting"` and `"fifo"` order modes.
+- Uses pointer-based scanning and leasing for concurrent processing.
+- Includes cron-based recovery and pointer garbage collection.
+
+## Example
+
+See `/Users/dangoodman/code/quick-convex/example/convex/example.ts` for end-to-end usage with `Quick`.

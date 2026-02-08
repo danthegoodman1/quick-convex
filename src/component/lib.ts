@@ -12,6 +12,7 @@ import { internal } from "./_generated/api.js"
 import schema from "./schema.js"
 
 export type QueueOrder = "vesting" | "fifo"
+export type HandlerType = "action" | "mutation"
 
 const DEFAULT_LEASE_DURATION_MS = 30_000
 const MIN_INACTIVE_BEFORE_DELETE_MS = 60_000
@@ -157,6 +158,7 @@ export const enqueue = mutation({
     queueId: v.string(),
     payload: v.any(),
     handler: v.string(),
+    handlerType: v.optional(v.union(v.literal("action"), v.literal("mutation"))),
     delayMs: v.optional(v.number()),
     config: v.optional(configValidator),
   },
@@ -172,6 +174,7 @@ export const enqueue = mutation({
       queueId: args.queueId,
       payload: args.payload,
       handler: args.handler,
+      handlerType: args.handlerType ?? "action",
       vestingTime,
       errorCount: 0,
     })
@@ -208,6 +211,7 @@ export const enqueueBatch = mutation({
         queueId: v.string(),
         payload: v.any(),
         handler: v.string(),
+        handlerType: v.optional(v.union(v.literal("action"), v.literal("mutation"))),
         delayMs: v.optional(v.number()),
       })
     ),
@@ -232,6 +236,7 @@ export const enqueueBatch = mutation({
         queueId: item.queueId,
         payload: item.payload,
         handler: item.handler,
+        handlerType: item.handlerType ?? "action",
         vestingTime,
         errorCount: 0,
       })
@@ -585,6 +590,7 @@ export const requeue = internalMutation({
         queueId: item.queueId,
         payload: item.payload,
         handler: item.handler,
+        handlerType: item.handlerType ?? "action",
         errorCount: newErrorCount,
         lastError: args.error,
         movedAt: now,
@@ -782,6 +788,7 @@ export const replayDeadLetter = mutation({
       queueId: deadLetter.queueId,
       payload: deadLetter.payload,
       handler: deadLetter.handler,
+      handlerType: deadLetter.handlerType ?? "action",
       vestingTime,
       errorCount: 0,
     })

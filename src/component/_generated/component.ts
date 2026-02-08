@@ -41,6 +41,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
           };
           delayMs?: number;
           handler: string;
+          handlerType?: "action" | "mutation";
           payload: any;
           queueId: string;
         },
@@ -65,6 +66,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
           items: Array<{
             delayMs?: number;
             handler: string;
+            handlerType?: "action" | "mutation";
             payload: any;
             queueId: string;
           }>;
@@ -93,6 +95,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
           _id: string;
           errorCount: number;
           handler: string;
+          handlerType?: "action" | "mutation";
           lastError?: string;
           movedAt: number;
           payload: any;

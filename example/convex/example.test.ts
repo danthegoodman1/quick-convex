@@ -1,26 +1,31 @@
-import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
+import { describe, expect, test } from "vitest";
 import { initConvexTest } from "./setup.test";
 import { api } from "./_generated/api";
 
 describe("example", () => {
-  beforeEach(async () => {
-    vi.useFakeTimers();
-  });
-
-  afterEach(async () => {
-    vi.useRealTimers();
-  });
-
-  test("addComment and listComments", async () => {
+  test("enqueueCommentAction enqueues a job", async () => {
     const t = initConvexTest();
-    const targetId = "test-subject-1";
-    const commentId = await t.mutation(api.example.addComment, {
-      text: "My comment",
-      targetId,
+
+    const itemId = await t.mutation(api.example.enqueueCommentAction, {
+      text: "hello",
+      targetId: "post-1",
     });
-    expect(commentId).toBeDefined();
-    const comments = await t.query(api.example.listComments, { targetId });
-    expect(comments).toHaveLength(1);
-    expect(comments[0].text).toBe("My comment");
+
+    const stats = await t.query(api.example.queueStats, { targetId: "post-1" });
+    expect(itemId).toBeDefined();
+    expect(stats.itemCount).toBe(1);
+  });
+
+  test("enqueueCommentMutation enqueues a job", async () => {
+    const t = initConvexTest();
+
+    const itemId = await t.mutation(api.example.enqueueCommentMutation, {
+      text: "hello",
+      targetId: "post-2",
+    });
+
+    const stats = await t.query(api.example.queueStats, { targetId: "post-2" });
+    expect(itemId).toBeDefined();
+    expect(stats.itemCount).toBe(1);
   });
 });

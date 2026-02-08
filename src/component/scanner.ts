@@ -334,6 +334,7 @@ export const runManager = internalAction({
           itemId: item.item._id,
           leaseId: item.leaseId,
           handler: item.item.handler,
+          handlerType: item.item.handlerType ?? "action",
           payload: item.item.payload,
           queueId: args.queueId,
         })
@@ -394,6 +395,7 @@ export const runWorker = internalAction({
     itemId: v.id("queueItems"),
     leaseId: v.string(),
     handler: v.string(),
+    handlerType: v.union(v.literal("action"), v.literal("mutation")),
     payload: v.any(),
     queueId: v.string(),
   },
@@ -442,14 +444,25 @@ export const runWorker = internalAction({
     let handlerError: unknown | null = null
 
     try {
-      const fnHandle = args.handler as FunctionHandle<
-        "action",
-        { payload: unknown; queueId: string }
-      >
-      await ctx.runAction(fnHandle, {
-        payload: args.payload,
-        queueId: args.queueId,
-      })
+      if (args.handlerType === "mutation") {
+        const fnHandle = args.handler as FunctionHandle<
+          "mutation",
+          { payload: unknown; queueId: string }
+        >
+        await ctx.runMutation(fnHandle, {
+          payload: args.payload,
+          queueId: args.queueId,
+        })
+      } else {
+        const fnHandle = args.handler as FunctionHandle<
+          "action",
+          { payload: unknown; queueId: string }
+        >
+        await ctx.runAction(fnHandle, {
+          payload: args.payload,
+          queueId: args.queueId,
+        })
+      }
     } catch (error) {
       handlerError = error
     }

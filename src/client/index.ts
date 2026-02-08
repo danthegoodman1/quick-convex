@@ -1,155 +1,179 @@
 import {
-  actionGeneric,
-  httpActionGeneric,
-  mutationGeneric,
-  queryGeneric,
+  createFunctionHandle,
+  getFunctionName,
+  type FunctionArgs,
+  type FunctionReference,
+  type FunctionReturnType,
 } from "convex/server";
-import type {
-  Auth,
-  GenericActionCtx,
-  GenericDataModel,
-  HttpRouter,
-} from "convex/server";
-import { v } from "convex/values";
 import type { ComponentApi } from "../component/_generated/component.js";
 
-// See the example/convex/example.ts file for how to use this component.
+type WorkerHandlerType = "action" | "mutation";
 
-/**
- *
- * @param ctx
- * @param targetId
- */
-export function translate(
-  ctx: ActionCtx,
-  component: ComponentApi,
-  commentId: string,
-) {
-  // By wrapping the function call, we can read from environment variables.
-  const baseUrl = getDefaultBaseUrlUsingEnv();
-  return ctx.runAction(component.lib.translate, { commentId, baseUrl });
-}
+type WorkerArgShape<TPayload> = {
+  payload: TPayload;
+  queueId: string;
+};
 
-/**
- * For re-exporting of an API accessible from React clients.
- * e.g. `export const { list, add, translate } =
- * exposeApi(components.quickConvex, {
- *   auth: async (ctx, operation) => { ... },
- * });`
- * See example/convex/example.ts.
- */
-export function exposeApi(
-  component: ComponentApi,
-  options: {
-    /**
-     * It's very important to authenticate any functions that users will export.
-     * This function should return the authorized user's ID.
-     */
-    auth: (
-      ctx: { auth: Auth },
-      operation:
-        | { type: "read"; targetId: string }
-        | { type: "create"; targetId: string }
-        | { type: "update"; commentId: string },
-    ) => Promise<string>;
-    baseUrl?: string;
-  },
-) {
-  const baseUrl = options.baseUrl ?? getDefaultBaseUrlUsingEnv();
-  return {
-    list: queryGeneric({
-      args: { targetId: v.string() },
-      handler: async (ctx, args) => {
-        await options.auth(ctx, { type: "read", targetId: args.targetId });
-        return await ctx.runQuery(component.lib.list, {
-          targetId: args.targetId,
-        });
-      },
-    }),
-    add: mutationGeneric({
-      args: { text: v.string(), targetId: v.string() },
-      handler: async (ctx, args) => {
-        const userId = await options.auth(ctx, {
-          type: "create",
-          targetId: args.targetId,
-        });
-        return await ctx.runMutation(component.lib.add, {
-          text: args.text,
-          userId: userId,
-          targetId: args.targetId,
-        });
-      },
-    }),
-    translate: actionGeneric({
-      args: { commentId: v.string() },
-      handler: async (ctx, args) => {
-        await options.auth(ctx, {
-          type: "update",
-          commentId: args.commentId,
-        });
-        return await ctx.runAction(component.lib.translate, {
-          commentId: args.commentId,
-          baseUrl,
-        });
-      },
-    }),
-  };
-}
+type WorkerRef<
+  TType extends WorkerHandlerType,
+  TPayload = unknown,
+> = FunctionReference<TType, "public" | "internal", WorkerArgShape<TPayload>>;
 
-/**
- * Register HTTP routes for the component.
- * This allows you to expose HTTP endpoints for the component.
- * See example/convex/http.ts for an example.
- */
-export function registerRoutes(
-  http: HttpRouter,
-  component: ComponentApi,
-  { pathPrefix = "/comments" }: { pathPrefix?: string } = {},
-) {
-  http.route({
-    path: `${pathPrefix}/last`,
-    method: "GET",
-    // Note we use httpActionGeneric here because it will be registered in
-    // the app's http.ts file, which has a different type than our `httpAction`.
-    handler: httpActionGeneric(async (ctx, request) => {
-      const targetId = new URL(request.url).searchParams.get("targetId");
-      if (!targetId) {
-        return new Response(
-          JSON.stringify({ error: "targetId parameter required" }),
-          {
-            status: 400,
-            headers: {
-              "Content-Type": "application/json",
-            },
-          },
-        );
-      }
-      const comments = await ctx.runQuery(component.lib.list, {
-        targetId,
-      });
-      const lastComment = comments[0] ?? null;
-      return new Response(JSON.stringify(lastComment), {
-        status: 200,
-        headers: {
-          "Content-Type": "application/json",
-        },
-      });
-    }),
-  });
-}
+type BatchInputItem<TRef extends FunctionReference<any, any, any>> = {
+  queueId: string;
+  fn: TRef;
+  args: unknown;
+  delayMs?: number;
+};
 
-function getDefaultBaseUrlUsingEnv() {
-  return process.env.BASE_URL ?? "https://pirate.monkeyness.com";
-}
+type NormalizedBatchItem<TItem> = TItem extends BatchInputItem<
+  infer TRef extends FunctionReference<any, any, any>
+>
+  ? {
+      queueId: string;
+      fn: TRef;
+      args: WorkerPayload<TRef>;
+      delayMs?: number;
+    }
+  : never;
 
-// Convenient types for `ctx` args, that only include the bare minimum.
-
-// type QueryCtx = Pick<GenericQueryCtx<GenericDataModel>, "runQuery">;
-// type MutationCtx = Pick<
-//   GenericMutationCtx<GenericDataModel>,
-//   "runQuery" | "runMutation"
-// >;
-type ActionCtx = Pick<
-  GenericActionCtx<GenericDataModel>,
-  "runQuery" | "runMutation" | "runAction"
+export type ActionWorkerRef<TPayload = unknown> = WorkerRef<"action", TPayload>;
+export type MutationWorkerRef<TPayload = unknown> = WorkerRef<
+  "mutation",
+  TPayload
 >;
+
+export type WorkerPayload<
+  Fn extends FunctionReference<any, any, any>,
+> = FunctionArgs<Fn> extends WorkerArgShape<infer TPayload>
+  ? Exclude<keyof FunctionArgs<Fn>, keyof WorkerArgShape<TPayload>> extends never
+    ? TPayload
+    : never
+  : never;
+
+export type QuickCtx = {
+  runMutation: <Ref extends FunctionReference<"mutation", any, any>>(
+    mutation: Ref,
+    args: FunctionArgs<Ref>,
+  ) => Promise<FunctionReturnType<Ref>>;
+};
+
+export type EnqueueActionRequest<
+  Fn extends ActionWorkerRef<any> = ActionWorkerRef<any>,
+> = {
+  queueId: string;
+  fn: Fn;
+  args: WorkerPayload<Fn>;
+  delayMs?: number;
+};
+
+export type EnqueueMutationRequest<
+  Fn extends MutationWorkerRef<any> = MutationWorkerRef<any>,
+> = {
+  queueId: string;
+  fn: Fn;
+  args: WorkerPayload<Fn>;
+  delayMs?: number;
+};
+
+export type EnqueueBatchActionItem<
+  Fn extends ActionWorkerRef<any> = ActionWorkerRef<any>,
+> = EnqueueActionRequest<Fn>;
+
+export type EnqueueBatchMutationItem<
+  Fn extends MutationWorkerRef<any> = MutationWorkerRef<any>,
+> = EnqueueMutationRequest<Fn>;
+
+export class Quick {
+  constructor(private readonly component: ComponentApi) {}
+
+  async enqueueAction<Fn extends ActionWorkerRef<any>>(
+    ctx: QuickCtx,
+    request: EnqueueActionRequest<Fn>,
+  ) {
+    return await this.enqueueWithType(ctx, request, "action");
+  }
+
+  async enqueueMutation<Fn extends MutationWorkerRef<any>>(
+    ctx: QuickCtx,
+    request: EnqueueMutationRequest<Fn>,
+  ) {
+    return await this.enqueueWithType(ctx, request, "mutation");
+  }
+
+  async enqueueBatchAction<
+    Items extends ReadonlyArray<BatchInputItem<ActionWorkerRef<any>>>,
+  >(
+    ctx: QuickCtx,
+    items: Items & { [K in keyof Items]: NormalizedBatchItem<Items[K]> },
+  ) {
+    return await this.enqueueBatchWithType(ctx, items, "action");
+  }
+
+  async enqueueBatchMutation<
+    Items extends ReadonlyArray<BatchInputItem<MutationWorkerRef<any>>>,
+  >(
+    ctx: QuickCtx,
+    items: Items & { [K in keyof Items]: NormalizedBatchItem<Items[K]> },
+  ) {
+    return await this.enqueueBatchWithType(ctx, items, "mutation");
+  }
+
+  private async enqueueWithType<
+    Fn extends FunctionReference<WorkerHandlerType, "public" | "internal", any>,
+  >(
+    ctx: QuickCtx,
+    request: {
+      queueId: string;
+      fn: Fn;
+      args: WorkerPayload<Fn>;
+      delayMs?: number;
+    },
+    handlerType: WorkerHandlerType,
+  ) {
+    const handle = await createFunctionHandle(request.fn);
+    return await ctx.runMutation(this.component.lib.enqueue, {
+      queueId: request.queueId,
+      payload: request.args,
+      handler: handle,
+      handlerType,
+      delayMs: request.delayMs,
+    });
+  }
+
+  private async enqueueBatchWithType<
+    Fn extends FunctionReference<WorkerHandlerType, "public" | "internal", any>,
+  >(
+    ctx: QuickCtx,
+    items: ReadonlyArray<{
+      queueId: string;
+      fn: Fn;
+      args: WorkerPayload<Fn>;
+      delayMs?: number;
+    }>,
+    handlerType: WorkerHandlerType,
+  ) {
+    const handleByFunction = new Map<string, string>();
+    const mappedItems = [];
+
+    for (const item of items) {
+      const functionName = getFunctionName(item.fn);
+      let handle = handleByFunction.get(functionName);
+      if (!handle) {
+        handle = await createFunctionHandle(item.fn);
+        handleByFunction.set(functionName, handle);
+      }
+      mappedItems.push({
+        queueId: item.queueId,
+        payload: item.args,
+        handler: handle,
+        handlerType,
+        delayMs: item.delayMs,
+      });
+    }
+
+    return await ctx.runMutation(this.component.lib.enqueueBatch, {
+      items: mappedItems,
+    });
+  }
+}
