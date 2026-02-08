@@ -6,13 +6,12 @@ export default defineSchema({
     queueId: v.string(),
     payload: v.any(),
     handler: v.string(),
-    priority: v.number(),
     vestingTime: v.number(),
     leaseId: v.optional(v.string()),
     leaseExpiry: v.optional(v.number()),
     errorCount: v.number(),
   })
-    .index("by_queue_priority_vesting", ["queueId", "priority", "vestingTime"])
+    .index("by_queue_and_vesting_time", ["queueId", "vestingTime"])
     .index("by_queue_fifo", ["queueId"]),
 
   queuePointers: defineTable({
@@ -47,7 +46,7 @@ export default defineSchema({
     scannerBackoffMaxMs: v.optional(v.number()),
     pointerBatchSize: v.optional(v.number()),
     maxConcurrentManagers: v.optional(v.number()),
-    defaultPriority: v.optional(v.number()),
+    defaultOrderBy: v.optional(v.union(v.literal("vesting"), v.literal("fifo"))),
     defaultLeaseDurationMs: v.optional(v.number()),
     minInactiveBeforeDeleteMs: v.optional(v.number()),
     maxRetries: v.optional(v.number()),

@@ -11,10 +11,12 @@ import {
 import { internal } from "./_generated/api.js"
 import schema from "./schema.js"
 
-const DEFAULT_PRIORITY = 0
+export type QueueOrder = "vesting" | "fifo"
+
 const DEFAULT_LEASE_DURATION_MS = 30_000
 const MIN_INACTIVE_BEFORE_DELETE_MS = 60_000
 const MAX_RETRIES = 10
+const DEFAULT_ORDER_BY: QueueOrder = "vesting"
 
 const queueItemValidator = schema.tables.queueItems.validator.extend({
   _id: v.id("queueItems"),
@@ -36,7 +38,7 @@ const resolvedConfigValidator = v.object({
   scannerBackoffMaxMs: v.number(),
   pointerBatchSize: v.number(),
   maxConcurrentManagers: v.number(),
-  defaultPriority: v.number(),
+  defaultOrderBy: v.union(v.literal("vesting"), v.literal("fifo")),
   defaultLeaseDurationMs: v.number(),
   minInactiveBeforeDeleteMs: v.number(),
   maxRetries: v.number(),
@@ -48,7 +50,7 @@ export type ResolvedConfig = {
   scannerBackoffMaxMs: number
   pointerBatchSize: number
   maxConcurrentManagers: number
-  defaultPriority: number
+  defaultOrderBy: QueueOrder
   defaultLeaseDurationMs: number
   minInactiveBeforeDeleteMs: number
   maxRetries: number
@@ -60,7 +62,7 @@ const CONFIG_DEFAULTS: ResolvedConfig = {
   scannerBackoffMaxMs: 5_000,
   pointerBatchSize: 50,
   maxConcurrentManagers: 10,
-  defaultPriority: DEFAULT_PRIORITY,
+  defaultOrderBy: DEFAULT_ORDER_BY,
   defaultLeaseDurationMs: DEFAULT_LEASE_DURATION_MS,
   minInactiveBeforeDeleteMs: MIN_INACTIVE_BEFORE_DELETE_MS,
   maxRetries: MAX_RETRIES,
@@ -74,7 +76,7 @@ function applyConfigDefaults(partial: Partial<Config> | null | undefined): Resol
     scannerBackoffMaxMs: partial.scannerBackoffMaxMs ?? CONFIG_DEFAULTS.scannerBackoffMaxMs,
     pointerBatchSize: partial.pointerBatchSize ?? CONFIG_DEFAULTS.pointerBatchSize,
     maxConcurrentManagers: partial.maxConcurrentManagers ?? CONFIG_DEFAULTS.maxConcurrentManagers,
-    defaultPriority: partial.defaultPriority ?? CONFIG_DEFAULTS.defaultPriority,
+    defaultOrderBy: partial.defaultOrderBy ?? CONFIG_DEFAULTS.defaultOrderBy,
     defaultLeaseDurationMs: partial.defaultLeaseDurationMs ?? CONFIG_DEFAULTS.defaultLeaseDurationMs,
     minInactiveBeforeDeleteMs: partial.minInactiveBeforeDeleteMs ?? CONFIG_DEFAULTS.minInactiveBeforeDeleteMs,
     maxRetries: partial.maxRetries ?? CONFIG_DEFAULTS.maxRetries,
@@ -102,14 +104,15 @@ async function resolveAndMaybeUpdateConfig(
     return applyConfigDefaults(existing)
   }
 
-  const fieldsToUpdate: Partial<Config> = {}
-  for (const [key, value] of Object.entries(updates)) {
-    if (value === undefined) continue
-    const existingValue = existing?.[key as keyof Config]
-    if (existingValue !== value) {
-      fieldsToUpdate[key as keyof Config] = value
-    }
-  }
+  const sanitizedUpdates = Object.fromEntries(
+    Object.entries(updates).filter(([, value]) => value !== undefined)
+  ) as Partial<Config>
+
+  const fieldsToUpdate = Object.fromEntries(
+    (Object.entries(sanitizedUpdates) as Array<[keyof Config, Config[keyof Config]]>).filter(
+      ([key, value]) => existing?.[key] !== value
+    )
+  ) as Partial<Config>
 
   if (Object.keys(fieldsToUpdate).length > 0) {
     if (existing) {
@@ -153,13 +156,14 @@ export const enqueue = mutation({
     queueId: v.string(),
     payload: v.any(),
     handler: v.string(),
-    priority: v.optional(v.number()),
     delayMs: v.optional(v.number()),
     config: v.optional(configValidator),
   },
   returns: v.id("queueItems"),
   handler: async (ctx, args) => {
-    const config = await resolveAndMaybeUpdateConfig(ctx, args.config)
+    if (args.config) {
+      await resolveAndMaybeUpdateConfig(ctx, args.config)
+    }
     const now = Date.now()
     const vestingTime = now + (args.delayMs ?? 0)
 
@@ -167,7 +171,6 @@ export const enqueue = mutation({
       queueId: args.queueId,
       payload: args.payload,
       handler: args.handler,
-      priority: args.priority ?? config.defaultPriority,
       vestingTime,
       errorCount: 0,
     })
@@ -205,7 +208,6 @@ export const enqueueBatch = mutation({
         queueId: v.string(),
         payload: v.any(),
         handler: v.string(),
-        priority: v.optional(v.number()),
         delayMs: v.optional(v.number()),
       })
     ),
@@ -213,7 +215,9 @@ export const enqueueBatch = mutation({
   },
   returns: v.array(v.id("queueItems")),
   handler: async (ctx, args) => {
-    const config = await resolveAndMaybeUpdateConfig(ctx, args.config)
+    if (args.config) {
+      await resolveAndMaybeUpdateConfig(ctx, args.config)
+    }
     const now = Date.now()
     const itemIds: Array<typeof schema.tables.queueItems.validator.type & { _id: string }> = []
     const pointerUpdates = new Map<
@@ -228,7 +232,6 @@ export const enqueueBatch = mutation({
         queueId: item.queueId,
         payload: item.payload,
         handler: item.handler,
-        priority: item.priority ?? config.defaultPriority,
         vestingTime,
         errorCount: 0,
       })
@@ -322,8 +325,6 @@ export const obtainPointerLease = internalMutation({
   },
 })
 
-type QueueOrder = "priority" | "fifo"
-
 async function collectAvailableItems(
   db: QueryCtx["db"],
   args: {
@@ -340,7 +341,7 @@ async function collectAvailableItems(
           .withIndex("by_queue_fifo", (q) => q.eq("queueId", args.queueId))
       : db
           .query("queueItems")
-          .withIndex("by_queue_priority_vesting", (q) =>
+          .withIndex("by_queue_and_vesting_time", (q) =>
             q.eq("queueId", args.queueId)
           )
 
@@ -377,13 +378,14 @@ export const peekItems = internalQuery({
   args: {
     queueId: v.string(),
     limit: v.optional(v.number()),
-    orderBy: v.optional(v.union(v.literal("priority"), v.literal("fifo"))),
+    orderBy: v.optional(v.union(v.literal("vesting"), v.literal("fifo"))),
   },
   returns: v.array(queueItemValidator),
   handler: async (ctx, args) => {
+    const config = await resolveConfig(ctx)
     const now = Date.now()
     const limit = args.limit ?? 100
-    const orderBy = (args.orderBy ?? "priority") as QueueOrder
+    const orderBy = (args.orderBy ?? config.defaultOrderBy) as QueueOrder
 
     return await collectAvailableItems(ctx.db, {
       queueId: args.queueId,
@@ -462,7 +464,7 @@ export const dequeue = internalMutation({
     queueId: v.string(),
     limit: v.optional(v.number()),
     leaseDurationMs: v.optional(v.number()),
-    orderBy: v.optional(v.union(v.literal("priority"), v.literal("fifo"))),
+    orderBy: v.optional(v.union(v.literal("vesting"), v.literal("fifo"))),
   },
   returns: v.array(
     v.object({
@@ -475,7 +477,7 @@ export const dequeue = internalMutation({
     const now = Date.now()
     const limit = args.limit ?? 10
     const leaseDurationMs = args.leaseDurationMs ?? config.defaultLeaseDurationMs
-    const orderBy = (args.orderBy ?? "priority") as QueueOrder
+    const orderBy = (args.orderBy ?? config.defaultOrderBy) as QueueOrder
 
     const availableItems = await collectAvailableItems(ctx.db, {
       queueId: args.queueId,
@@ -530,7 +532,7 @@ export const complete = internalMutation({
 
     const remainingItems = await ctx.db
       .query("queueItems")
-      .withIndex("by_queue_priority_vesting", (q) =>
+      .withIndex("by_queue_and_vesting_time", (q) =>
         q.eq("queueId", item.queueId)
       )
       .first()
@@ -673,7 +675,7 @@ export const garbageCollectPointers = internalMutation({
 
       const hasItems = await ctx.db
         .query("queueItems")
-        .withIndex("by_queue_priority_vesting", (q) =>
+      .withIndex("by_queue_and_vesting_time", (q) =>
           q.eq("queueId", pointer.queueId)
         )
         .first()
@@ -703,7 +705,7 @@ export const getQueueStats = query({
 
     const items = await ctx.db
       .query("queueItems")
-      .withIndex("by_queue_priority_vesting", (q) =>
+      .withIndex("by_queue_and_vesting_time", (q) =>
         q.eq("queueId", args.queueId)
       )
       .collect()
@@ -760,12 +762,10 @@ export const listDeadLetters = query({
 export const replayDeadLetter = mutation({
   args: {
     deadLetterId: v.id("deadLetterItems"),
-    priority: v.optional(v.number()),
     delayMs: v.optional(v.number()),
   },
   returns: v.union(v.null(), v.id("queueItems")),
   handler: async (ctx, args) => {
-    const config = await resolveConfig(ctx)
     const deadLetter = await ctx.db.get(args.deadLetterId)
 
     if (!deadLetter) {
@@ -779,7 +779,6 @@ export const replayDeadLetter = mutation({
       queueId: deadLetter.queueId,
       payload: deadLetter.payload,
       handler: deadLetter.handler,
-      priority: args.priority ?? config.defaultPriority,
       vestingTime,
       errorCount: 0,
     })

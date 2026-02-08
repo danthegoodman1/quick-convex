@@ -151,25 +151,15 @@ export const runScanner = internalAction({
       return
     }
 
-    const managerPromises = result.pointers.map(
-      (pointer: {
-        pointerId: Id<"queuePointers">
-        queueId: string
-        pointerLeaseId: string
-      }) =>
-        ctx.runAction(internal.scanner.runManager, {
+    await Promise.all(
+      result.pointers.map((pointer) =>
+        ctx.scheduler.runAfter(0, internal.scanner.runManager, {
           pointerId: pointer.pointerId,
           queueId: pointer.queueId,
           pointerLeaseId: pointer.pointerLeaseId,
         })
+      )
     )
-
-    const results = await Promise.allSettled(managerPromises)
-    const failures = results.filter((result) => result.status === "rejected")
-
-    if (failures.length > 0) {
-      console.error("Scanner manager failures", failures.length)
-    }
 
     await ctx.runMutation(internal.scanner.rescheduleScanner, {
       leaseId: args.leaseId,
@@ -238,25 +228,17 @@ export const runManager = internalAction({
       return
     }
 
-    const workerPromises = items.map(
-      (item: {
-        item: {
-          _id: Id<"queueItems">
-          payload: unknown
-          handler: string
-        }
-        leaseId: string
-      }) =>
-        ctx.runAction(internal.scanner.runWorker, {
+    await Promise.all(
+      items.map((item) =>
+        ctx.scheduler.runAfter(0, internal.scanner.runWorker, {
           itemId: item.item._id,
           leaseId: item.leaseId,
           handler: item.item.handler,
           payload: item.item.payload,
           queueId: args.queueId,
         })
+      )
     )
-
-    await Promise.all(workerPromises)
 
     await ctx.runMutation(internal.scanner.finalizePointer, {
       pointerId: args.pointerId,
@@ -285,18 +267,22 @@ export const finalizePointer = internalMutation({
       return null
     }
 
-    const hasItems = await ctx.db
+    const nextItem = await ctx.db
       .query("queueItems")
-      .withIndex("by_queue_fifo", (q) =>
+      .withIndex("by_queue_and_vesting_time", (q) =>
         q.eq("queueId", pointer.queueId)
       )
       .first()
 
+    const nextVestingTime = nextItem
+      ? Math.max(now, nextItem.vestingTime)
+      : now
+
     await ctx.db.patch(args.pointerId, {
       leaseId: undefined,
       leaseExpiry: undefined,
-      vestingTime: now,
-      lastActiveTime: hasItems ? now : pointer.lastActiveTime,
+      vestingTime: nextVestingTime,
+      lastActiveTime: nextItem ? now : pointer.lastActiveTime,
     })
 
     return null

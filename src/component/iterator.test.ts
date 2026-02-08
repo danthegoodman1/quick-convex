@@ -16,7 +16,6 @@ describe("async iterator", () => {
         queueId,
         payload: { value: 1 },
         handler: "testHandler",
-        priority: 0,
         vestingTime: 500, // before now
         errorCount: 0,
       })
@@ -24,7 +23,6 @@ describe("async iterator", () => {
         queueId,
         payload: { value: 2 },
         handler: "testHandler",
-        priority: 0,
         vestingTime: 800, // before now
         errorCount: 0,
       })
@@ -32,7 +30,6 @@ describe("async iterator", () => {
         queueId,
         payload: { value: 3 },
         handler: "testHandler",
-        priority: 0,
         vestingTime: 1500, // after now - should break
         errorCount: 0,
       })
