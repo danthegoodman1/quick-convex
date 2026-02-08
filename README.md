@@ -200,4 +200,4 @@ Quick is heavily inspired by Convex Workpools and the QuiCK paper. Workpools are
 
 ## Example
 
-See `/Users/dangoodman/code/quick-convex/example/convex/example.ts` for end-to-end usage with `Quick`.
+See `example/convex/example.ts` for end-to-end usage with `Quick`.
