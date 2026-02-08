@@ -119,6 +119,32 @@ export const enqueueBatch = mutation({
 
 In practice, FIFO queues are often a cleaner and more performant alternative to creating many `maxParallelism: 1` workpools (one per ordering domain). With Quick FIFO, use `queueId` as the domain key (for example `userId`, `accountId`, or `aggregateId`), and each domain stays ordered while different domains can still process in parallel.
 
+## Compare to Convex Workpools
+
+Quick is heavily inspired by Convex Workpools and the QuiCK paper. Workpools are excellent and production-proven, and this component builds on many of the same ideas.
+
+### Workpools strengths
+
+- Slightly lighter weight runtime model.
+- Officially maintained by the Convex team.
+- Operationally simpler in many common setups.
+
+### Workpools edge case to be aware of
+
+- In some bursty scale-up patterns (idle `0` to many scheduled items), contention can appear around work claiming.
+- Sometimes work can stall when strange crashes happen, causing an up to 30 minute recovery time for a workpool.
+
+### Quick strengths
+
+- Multiple ordering modes, especially strict per-domain FIFO via `queueId`.
+- FIFO is much easier to model than emulating ordering via many `maxParallelism: 1` pools.
+- Faster ramp from idle to heavy load in contention-prone bursts.
+- Lower contention during scale-up in those same bursty scenarios.
+
+### Tradeoff to keep in mind
+
+- Quick is a bit heavier per unit work when load is low or not amortized (more queue-management actions/mutations around each job).
+
 ## Example
 
 See `/Users/dangoodman/code/quick-convex/example/convex/example.ts` for end-to-end usage with `Quick`.
