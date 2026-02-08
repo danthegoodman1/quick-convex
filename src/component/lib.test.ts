@@ -7,7 +7,7 @@ import {
   type ApiFromModules,
 } from "convex/server";
 import { v } from "convex/values";
-import { describe, expect, test } from "vitest";
+import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { internal } from "./_generated/api.js";
 import { action, mutation } from "./_generated/server.js";
 import { initConvexTest } from "./setup.test.js";
@@ -119,6 +119,15 @@ const testApi = (
 )["lib.test"];
 
 describe("component runtime execution", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.clearAllTimers();
+    vi.useRealTimers();
+  });
+
   test("runWorker executes action handlers", async () => {
     const t = initConvexTest();
     const probeId = await t.run(async (ctx) =>
