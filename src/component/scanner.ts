@@ -374,6 +374,7 @@ export const finalizePointer = internalMutation({
   handler: async (ctx, args) => {
     const now = Date.now()
     const pointer = await ctx.db.get(args.pointerId)
+    let cachedConfig: Awaited<ReturnType<typeof resolveConfig>> | null = null
 
     if (!pointer) {
       return null
@@ -396,30 +397,42 @@ export const finalizePointer = internalMutation({
             )
             .first()
 
-    let nextVestingTime = now
-    if (nextItem) {
-      if (
-        args.orderBy === "fifo" &&
-        nextItem.leaseExpiry !== undefined &&
-        nextItem.leaseExpiry > now
-      ) {
-        // FIFO head is currently leased. Recheck soon so completion can unblock
-        // following items without waiting for full lease expiry.
-        const config = await resolveConfig(ctx)
-        nextVestingTime = Math.min(
-          nextItem.leaseExpiry,
-          now + config.scannerBackoffMinMs
-        )
-      } else {
-        nextVestingTime = Math.max(now, nextItem.vestingTime)
+    let nextVestingTime: number
+    let nextLastActiveTime: number
+
+    if (!nextItem) {
+      if (!cachedConfig) {
+        cachedConfig = await resolveConfig(ctx)
       }
+      // Empty queues should park until the GC window to avoid hot-looping
+      // over pointers that currently have no items.
+      nextVestingTime = now + cachedConfig.minInactiveBeforeDeleteMs
+      nextLastActiveTime = now
+    } else if (
+      args.orderBy === "fifo" &&
+      nextItem.leaseExpiry !== undefined &&
+      nextItem.leaseExpiry > now
+    ) {
+      // FIFO head is currently leased. Recheck soon so completion can unblock
+      // following items without waiting for full lease expiry.
+      if (!cachedConfig) {
+        cachedConfig = await resolveConfig(ctx)
+      }
+      nextVestingTime = Math.min(
+        nextItem.leaseExpiry,
+        now + cachedConfig.scannerBackoffMinMs
+      )
+      nextLastActiveTime = now
+    } else {
+      nextVestingTime = Math.max(now, nextItem.vestingTime)
+      nextLastActiveTime = now
     }
 
     await ctx.db.patch(args.pointerId, {
       leaseId: undefined,
       leaseExpiry: undefined,
       vestingTime: nextVestingTime,
-      lastActiveTime: nextItem ? now : pointer.lastActiveTime,
+      lastActiveTime: nextLastActiveTime,
     })
 
     if (nextVestingTime <= now) {

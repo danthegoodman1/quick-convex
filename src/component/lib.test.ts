@@ -387,4 +387,37 @@ describe("component runtime execution", () => {
     expect(pointer).not.toBeNull();
     expect(pointer?.vestingTime).toBe(delayedHeadVesting);
   });
+
+  test("finalizePointer parks empty queues to avoid pointer hot-loop", async () => {
+    const t = initConvexTest();
+    const queueId = "queue-empty-pointer";
+    const now = Date.now();
+    const minInactiveBeforeDeleteMs = 12_345;
+
+    const pointerId = await t.run(async (ctx) => {
+      await ctx.db.insert("config", { minInactiveBeforeDeleteMs });
+      return await ctx.db.insert("queuePointers", {
+        queueId,
+        vestingTime: now,
+        leaseId: "pointer-lease",
+        leaseExpiry: now + 30_000,
+        lastActiveTime: now - 5_000,
+      });
+    });
+
+    await t.mutation(internal.scanner.finalizePointer, {
+      pointerId,
+      pointerLeaseId: "pointer-lease",
+      isEmpty: true,
+      orderBy: "vesting",
+    });
+
+    const pointer = await t.run(async (ctx) => ctx.db.get(pointerId));
+    expect(pointer).not.toBeNull();
+    expect(pointer?.vestingTime).toBeGreaterThanOrEqual(
+      now + minInactiveBeforeDeleteMs,
+    );
+    expect(pointer?.leaseId).toBeUndefined();
+    expect(pointer?.leaseExpiry).toBeUndefined();
+  });
 });
