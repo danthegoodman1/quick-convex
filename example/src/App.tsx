@@ -61,8 +61,28 @@ function App() {
           >
             Enqueue Mutation Worker
           </button>
+          <button
+            onClick={() =>
+              enqueueBatch({
+                targetId: queueId,
+                orderBy: "vesting",
+              })
+            }
+          >
+            Enqueue Batch (Vesting)
+          </button>
+          <button
+            onClick={() =>
+              enqueueBatch({
+                targetId: queueId,
+                orderBy: "fifo",
+              })
+            }
+          >
+            Enqueue Batch (FIFO)
+          </button>
           <button onClick={() => enqueueBatch({ targetId: queueId })}>
-            Enqueue Batch Action
+            Enqueue Batch (Current Mode)
           </button>
         </div>
 

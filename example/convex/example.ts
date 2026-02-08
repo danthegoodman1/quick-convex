@@ -67,9 +67,21 @@ export const enqueueCommentMutation = mutation({
 });
 
 export const enqueueCommentBatchAction = mutation({
-  args: { targetId: v.string() },
+  args: {
+    targetId: v.string(),
+    orderBy: v.optional(v.union(v.literal("vesting"), v.literal("fifo"))),
+  },
   returns: v.array(v.string()),
   handler: async (ctx, args) => {
+    if (args.orderBy) {
+      await ctx.runMutation(components.quickConvex.lib.enqueueBatch, {
+        items: [],
+        config: {
+          defaultOrderBy: args.orderBy,
+        },
+      });
+    }
+
     return await quick.enqueueBatchAction(ctx, [
       {
         queueId: args.targetId,
