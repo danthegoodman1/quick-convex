@@ -112,6 +112,13 @@ export const enqueueBatch = mutation({
 - Uses pointer-based scanning and leasing for concurrent processing.
 - Includes cron-based recovery and pointer garbage collection.
 
+### Choosing an ordering mode
+
+- Use `"vesting"` when throughput is the priority. Ready items can run as soon as they are due, so delayed/retried items do not block newer ready work in the same queue.
+- Use `"fifo"` when strict per-`queueId` ordering is required. This enforces head-of-line semantics for that ordering domain.
+
+In practice, FIFO queues are often a cleaner and more performant alternative to creating many `maxParallelism: 1` workpools (one per ordering domain). With Quick FIFO, use `queueId` as the domain key (for example `userId`, `accountId`, or `aggregateId`), and each domain stays ordered while different domains can still process in parallel.
+
 ## Example
 
 See `/Users/dangoodman/code/quick-convex/example/convex/example.ts` for end-to-end usage with `Quick`.
