@@ -25,12 +25,14 @@ void quick.enqueueAction(ctx, {
   queueId: "queue-a",
   fn: actionWorker,
   args: { value: 1 },
+  runAfter: 1_000,
 });
 
 void quick.enqueueMutation(ctx, {
   queueId: "queue-a",
   fn: mutationWorker,
   args: { value: 1 },
+  runAt: Date.now() + 1_000,
 });
 
 void quick.enqueueBatchAction(ctx, [
@@ -57,6 +59,9 @@ void quick.enqueueMutation(ctx, { queueId: "queue-a", fn: mutationWorker, args: 
 
 // @ts-expect-error worker args must be exactly payload + queueId
 void quick.enqueueAction(ctx, { queueId: "queue-a", fn: wrongShapeWorker, args: { value: 1 } });
+
+// @ts-expect-error delayMs was replaced by runAfter/runAt
+void quick.enqueueAction(ctx, { queueId: "queue-a", fn: actionWorker, args: { value: 1 }, delayMs: 1 });
 
 void quick.enqueueBatchAction(ctx, [
   {

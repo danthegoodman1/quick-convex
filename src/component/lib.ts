@@ -89,6 +89,28 @@ export async function resolveConfig(ctx: QueryCtx): Promise<ResolvedConfig> {
   return applyConfigDefaults(config)
 }
 
+function resolveVestingTime(
+  now: number,
+  args: {
+    runAfter?: number
+    runAt?: number
+  }
+): number {
+  if (args.runAfter !== undefined && args.runAt !== undefined) {
+    throw new Error("Specify only one of runAfter or runAt")
+  }
+
+  if (args.runAt !== undefined) {
+    return args.runAt
+  }
+
+  if (args.runAfter !== undefined) {
+    return now + args.runAfter
+  }
+
+  return now
+}
+
 export const getResolvedConfig = internalQuery({
   args: {},
   returns: resolvedConfigValidator,
@@ -159,7 +181,8 @@ export const enqueue = mutation({
     payload: v.any(),
     handler: v.string(),
     handlerType: v.optional(v.union(v.literal("action"), v.literal("mutation"))),
-    delayMs: v.optional(v.number()),
+    runAfter: v.optional(v.number()),
+    runAt: v.optional(v.number()),
     config: v.optional(configValidator),
   },
   returns: v.id("queueItems"),
@@ -168,7 +191,7 @@ export const enqueue = mutation({
       await resolveAndMaybeUpdateConfig(ctx, args.config)
     }
     const now = Date.now()
-    const vestingTime = now + (args.delayMs ?? 0)
+    const vestingTime = resolveVestingTime(now, args)
 
     const itemId = await ctx.db.insert("queueItems", {
       queueId: args.queueId,
@@ -212,7 +235,8 @@ export const enqueueBatch = mutation({
         payload: v.any(),
         handler: v.string(),
         handlerType: v.optional(v.union(v.literal("action"), v.literal("mutation"))),
-        delayMs: v.optional(v.number()),
+        runAfter: v.optional(v.number()),
+        runAt: v.optional(v.number()),
       })
     ),
     config: v.optional(configValidator),
@@ -230,7 +254,7 @@ export const enqueueBatch = mutation({
     >()
 
     for (const item of args.items) {
-      const vestingTime = now + (item.delayMs ?? 0)
+      const vestingTime = resolveVestingTime(now, item)
 
       const itemId = await ctx.db.insert("queueItems", {
         queueId: item.queueId,
@@ -750,7 +774,8 @@ export const listDeadLetters = query({
 export const replayDeadLetter = mutation({
   args: {
     deadLetterId: v.id("deadLetterItems"),
-    delayMs: v.optional(v.number()),
+    runAfter: v.optional(v.number()),
+    runAt: v.optional(v.number()),
   },
   returns: v.union(v.null(), v.id("queueItems")),
   handler: async (ctx, args) => {
@@ -761,7 +786,7 @@ export const replayDeadLetter = mutation({
     }
 
     const now = Date.now()
-    const vestingTime = now + (args.delayMs ?? 0)
+    const vestingTime = resolveVestingTime(now, args)
 
     const itemId = await ctx.db.insert("queueItems", {
       queueId: deadLetter.queueId,

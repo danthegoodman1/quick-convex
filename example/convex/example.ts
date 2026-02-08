@@ -46,27 +46,39 @@ export const processCommentMutation = mutation({
 });
 
 export const enqueueCommentAction = mutation({
-  args: { text: v.string(), targetId: v.string(), delayMs: v.optional(v.number()) },
+  args: {
+    text: v.string(),
+    targetId: v.string(),
+    runAfter: v.optional(v.number()),
+    runAt: v.optional(v.number()),
+  },
   returns: v.string(),
   handler: async (ctx, args) => {
     return await quickVesting.enqueueAction(ctx, {
       queueId: args.targetId,
       fn: processCommentActionRef,
       args: { text: args.text, targetId: args.targetId },
-      delayMs: args.delayMs,
+      runAfter: args.runAfter,
+      runAt: args.runAt,
     });
   },
 });
 
 export const enqueueCommentMutation = mutation({
-  args: { text: v.string(), targetId: v.string(), delayMs: v.optional(v.number()) },
+  args: {
+    text: v.string(),
+    targetId: v.string(),
+    runAfter: v.optional(v.number()),
+    runAt: v.optional(v.number()),
+  },
   returns: v.string(),
   handler: async (ctx, args) => {
     return await quickVesting.enqueueMutation(ctx, {
       queueId: args.targetId,
       fn: processCommentMutationRef,
       args: { text: args.text, targetId: args.targetId },
-      delayMs: args.delayMs,
+      runAfter: args.runAfter,
+      runAt: args.runAt,
     });
   },
 });

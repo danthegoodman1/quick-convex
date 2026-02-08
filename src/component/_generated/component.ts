@@ -39,11 +39,12 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
             scannerBackoffMinMs?: number;
             scannerLeaseDurationMs?: number;
           };
-          delayMs?: number;
           handler: string;
           handlerType?: "action" | "mutation";
           payload: any;
           queueId: string;
+          runAfter?: number;
+          runAt?: number;
         },
         string,
         Name
@@ -64,11 +65,12 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
             scannerLeaseDurationMs?: number;
           };
           items: Array<{
-            delayMs?: number;
             handler: string;
             handlerType?: "action" | "mutation";
             payload: any;
             queueId: string;
+            runAfter?: number;
+            runAt?: number;
           }>;
         },
         Array<string>,
@@ -106,7 +108,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
       replayDeadLetter: FunctionReference<
         "mutation",
         "internal",
-        { deadLetterId: string; delayMs?: number },
+        { deadLetterId: string; runAfter?: number; runAt?: number },
         null | string,
         Name
       >;

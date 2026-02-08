@@ -39,7 +39,8 @@ function makeComponentApiMock() {
       payload: any;
       handler: string;
       handlerType?: "action" | "mutation";
-      delayMs?: number;
+      runAfter?: number;
+      runAt?: number;
       config?: { defaultOrderBy: "vesting" | "fifo" };
     }
   >("component.lib:enqueue");
@@ -52,7 +53,8 @@ function makeComponentApiMock() {
         payload: any;
         handler: string;
         handlerType?: "action" | "mutation";
-        delayMs?: number;
+        runAfter?: number;
+        runAt?: number;
       }>;
       config?: { defaultOrderBy: "vesting" | "fifo" };
     }
@@ -93,7 +95,7 @@ describe("Quick client", () => {
       queueId: "queue-a",
       fn: actionWorkerRef,
       args: { value: 1 },
-      delayMs: 25,
+      runAfter: 25,
     });
 
     expect(result).toBe("item-id");
@@ -105,7 +107,8 @@ describe("Quick client", () => {
       payload: { value: 1 },
       handler: "action-handle",
       handlerType: "action",
-      delayMs: 25,
+      runAfter: 25,
+      runAt: undefined,
     });
   });
 
@@ -132,7 +135,8 @@ describe("Quick client", () => {
       payload: { value: 2 },
       handler: "mutation-handle",
       handlerType: "mutation",
-      delayMs: undefined,
+      runAfter: undefined,
+      runAt: undefined,
     });
   });
 
@@ -165,21 +169,24 @@ describe("Quick client", () => {
           payload: { value: 1 },
           handler: "handle:index.test:workerAction",
           handlerType: "action",
-          delayMs: undefined,
+          runAfter: undefined,
+          runAt: undefined,
         },
         {
           queueId: "queue-c",
           payload: { value: 2 },
           handler: "handle:index.test:workerAction",
           handlerType: "action",
-          delayMs: undefined,
+          runAfter: undefined,
+          runAt: undefined,
         },
         {
           queueId: "queue-c",
           payload: { value: 3 },
           handler: "handle:index.test:workerActionTwo",
           handlerType: "action",
-          delayMs: undefined,
+          runAfter: undefined,
+          runAt: undefined,
         },
       ],
     });
@@ -212,7 +219,8 @@ describe("Quick client", () => {
       payload: { value: 99 },
       handler: "handle:index.test:workerAction",
       handlerType: "action",
-      delayMs: undefined,
+      runAfter: undefined,
+      runAt: undefined,
       config: { defaultOrderBy: "fifo" },
     });
 
@@ -226,7 +234,8 @@ describe("Quick client", () => {
             payload: { value: 100 },
             handler: "handle:index.test:workerAction",
             handlerType: "action",
-            delayMs: undefined,
+            runAfter: undefined,
+            runAt: undefined,
           },
         ],
         config: { defaultOrderBy: "fifo" },

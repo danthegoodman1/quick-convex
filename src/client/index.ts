@@ -25,7 +25,8 @@ type BatchInputItem<TRef extends FunctionReference<any, any, any>> = {
   queueId: string;
   fn: TRef;
   args: unknown;
-  delayMs?: number;
+  runAfter?: number;
+  runAt?: number;
 };
 
 type NormalizedBatchItem<TItem> = TItem extends BatchInputItem<
@@ -35,7 +36,8 @@ type NormalizedBatchItem<TItem> = TItem extends BatchInputItem<
       queueId: string;
       fn: TRef;
       args: WorkerPayload<TRef>;
-      delayMs?: number;
+      runAfter?: number;
+      runAt?: number;
     }
   : never;
 
@@ -68,7 +70,8 @@ export type EnqueueActionRequest<
   queueId: string;
   fn: Fn;
   args: WorkerPayload<Fn>;
-  delayMs?: number;
+  runAfter?: number;
+  runAt?: number;
 };
 
 export type EnqueueMutationRequest<
@@ -77,7 +80,8 @@ export type EnqueueMutationRequest<
   queueId: string;
   fn: Fn;
   args: WorkerPayload<Fn>;
-  delayMs?: number;
+  runAfter?: number;
+  runAt?: number;
 };
 
 export type EnqueueBatchActionItem<
@@ -140,7 +144,8 @@ export class Quick {
       queueId: string;
       fn: Fn;
       args: WorkerPayload<Fn>;
-      delayMs?: number;
+      runAfter?: number;
+      runAt?: number;
     },
     handlerType: WorkerHandlerType,
   ) {
@@ -150,7 +155,8 @@ export class Quick {
       payload: request.args,
       handler: handle,
       handlerType,
-      delayMs: request.delayMs,
+      runAfter: request.runAfter,
+      runAt: request.runAt,
       ...(this.config ? { config: this.config } : {}),
     });
   }
@@ -163,7 +169,8 @@ export class Quick {
       queueId: string;
       fn: Fn;
       args: WorkerPayload<Fn>;
-      delayMs?: number;
+      runAfter?: number;
+      runAt?: number;
     }>,
     handlerType: WorkerHandlerType,
   ) {
@@ -182,7 +189,8 @@ export class Quick {
         payload: item.args,
         handler: handle,
         handlerType,
-        delayMs: item.delayMs,
+        runAfter: item.runAfter,
+        runAt: item.runAt,
       });
     }
 

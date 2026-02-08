@@ -56,7 +56,7 @@ export const enqueueEmail = mutation({
       queueId: args.userId,
       fn: api.jobs.sendEmailWorker,
       args: { userId: args.userId },
-      delayMs: 5_000,
+      runAfter: 5_000,
     });
   },
 });
