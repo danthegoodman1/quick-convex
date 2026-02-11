@@ -819,6 +819,231 @@ describe("component runtime execution", () => {
     expect(secondLease).toHaveLength(0);
   });
 
+  test("claimScannerLease is bounded by available manager slots", async () => {
+    const t = initConvexTest();
+    const now = Date.now();
+    const scannerLeaseId = "scanner-lease";
+
+    await t.run(async (ctx) => {
+      await ctx.db.insert("config", {
+        managerSlots: 2,
+        workersPerManager: 1,
+        pointerBatchSize: 10,
+      });
+      await ctx.db.insert("managerSlots", {
+        slotNumber: 0,
+        leaseId: "busy-slot",
+        leaseExpiry: now + 30_000,
+        queueId: "busy",
+      });
+      await ctx.db.insert("queuePointers", {
+        queueId: "queue-slot-a",
+        vestingTime: now - 1_000,
+        lastActiveTime: now,
+      });
+      await ctx.db.insert("queuePointers", {
+        queueId: "queue-slot-b",
+        vestingTime: now - 1_000,
+        lastActiveTime: now,
+      });
+      await ctx.db.insert("scannerState", {
+        leaseId: scannerLeaseId,
+        leaseExpiry: now + 5_000,
+        lastRunAt: now,
+      });
+    });
+
+    const result = await t.mutation(internal.scanner.claimScannerLease, {
+      leaseId: scannerLeaseId,
+    });
+
+    expect(result.valid).toBe(true);
+    expect(result.workersPerManager).toBe(1);
+    expect(result.pointers).toHaveLength(1);
+    expect(result.pointers[0].slotNumber).toBe(1);
+
+    const slots = await t.run(async (ctx) =>
+      ctx.db.query("managerSlots").withIndex("by_slot_number").collect(),
+    );
+    expect(slots.map((slot) => slot.slotNumber)).toEqual([0, 1]);
+  });
+
+  test("tryClaimManagerSlot claims and releases slot ownership", async () => {
+    const t = initConvexTest();
+    const now = Date.now();
+    const pointerLeaseId = "pointer-lease";
+
+    const pointerId = await t.run(async (ctx) => {
+      await ctx.db.insert("config", { managerSlots: 1 });
+      await ctx.db.insert("managerSlots", { slotNumber: 0 });
+      return await ctx.db.insert("queuePointers", {
+        queueId: "queue-slot-claim",
+        vestingTime: now,
+        leaseId: pointerLeaseId,
+        leaseExpiry: now + 600_000,
+        lastActiveTime: now,
+      });
+    });
+
+    const claim = await t.mutation(internal.scanner.tryClaimManagerSlot, {
+      slotNumber: 0,
+      pointerId,
+      pointerLeaseId,
+      queueId: "queue-slot-claim",
+    });
+    expect(claim.claimed).toBe(true);
+    expect(claim.slotLeaseId).toBeDefined();
+
+    const secondClaim = await t.mutation(internal.scanner.tryClaimManagerSlot, {
+      slotNumber: 0,
+      pointerId,
+      pointerLeaseId,
+      queueId: "queue-slot-claim",
+    });
+    expect(secondClaim.claimed).toBe(false);
+
+    const outOfRangeClaim = await t.mutation(internal.scanner.tryClaimManagerSlot, {
+      slotNumber: 1,
+      pointerId,
+      pointerLeaseId,
+      queueId: "queue-slot-claim",
+    });
+    expect(outOfRangeClaim.claimed).toBe(false);
+
+    const wrongRelease = await t.mutation(internal.scanner.releaseManagerSlot, {
+      slotNumber: 0,
+      slotLeaseId: "wrong-lease",
+    });
+    expect(wrongRelease).toBe(false);
+
+    const released = await t.mutation(internal.scanner.releaseManagerSlot, {
+      slotNumber: 0,
+      slotLeaseId: claim.slotLeaseId!,
+    });
+    expect(released).toBe(true);
+
+    const slot = await t.run(async (ctx) =>
+      ctx.db
+        .query("managerSlots")
+        .withIndex("by_slot_number", (q) => q.eq("slotNumber", 0))
+        .unique(),
+    );
+    expect(slot?.leaseId).toBeUndefined();
+    expect(slot?.leaseExpiry).toBeUndefined();
+    expect(slot?.pointerId).toBeUndefined();
+    expect(slot?.queueId).toBeUndefined();
+  });
+
+  test("runManager executes workers directly and releases manager slot", async () => {
+    const t = initConvexTest();
+    const now = Date.now();
+    const queueId = "queue-manager-direct";
+    const pointerLeaseId = "pointer-lease-manager";
+
+    const probeId = await t.run(async (ctx) =>
+      ctx.db.insert("queueItems", {
+        queueId: "probe",
+        payload: { executedBy: null },
+        handler: "probe",
+        vestingTime: 0,
+        errorCount: 0,
+      }),
+    );
+
+    const mutationHandle = await t.mutation(testApi.createWorkerHandle, {
+      type: "mutationExec",
+    });
+
+    const { pointerId, itemId } = await t.run(async (ctx) => {
+      await ctx.db.insert("config", {
+        managerSlots: 1,
+        workersPerManager: 1,
+      });
+      await ctx.db.insert("managerSlots", { slotNumber: 0 });
+
+      const pointerId = await ctx.db.insert("queuePointers", {
+        queueId,
+        vestingTime: now,
+        leaseId: pointerLeaseId,
+        leaseExpiry: now + 600_000,
+        lastActiveTime: now,
+      });
+      const itemId = await ctx.db.insert("queueItems", {
+        queueId,
+        payload: { probeId },
+        handler: mutationHandle,
+        handlerType: "mutation",
+        vestingTime: now - 1_000,
+        errorCount: 0,
+      });
+      return { pointerId, itemId };
+    });
+
+    await t.action(internal.scanner.runManager, {
+      pointerId,
+      queueId,
+      pointerLeaseId,
+      orderBy: "vesting",
+      workersPerManager: 1,
+      slotNumber: 0,
+    });
+
+    const [probe, item, pointer, slot] = await t.run(async (ctx) =>
+      Promise.all([
+        ctx.db.get(probeId),
+        ctx.db.get(itemId),
+        ctx.db.get(pointerId),
+        ctx.db
+          .query("managerSlots")
+          .withIndex("by_slot_number", (q) => q.eq("slotNumber", 0))
+          .unique(),
+      ]),
+    );
+
+    expect(probe?.payload).toEqual({ executedBy: "mutation" });
+    expect(item).toBeNull();
+    expect(pointer?.leaseId).toBeUndefined();
+    expect(pointer?.leaseExpiry).toBeUndefined();
+    expect(slot?.leaseId).toBeUndefined();
+    expect(slot?.leaseExpiry).toBeUndefined();
+  });
+
+  test("runManager finalizes pointer when manager slot claim fails", async () => {
+    const t = initConvexTest();
+    const now = Date.now();
+    const queueId = "queue-manager-claim-fail";
+    const pointerLeaseId = "pointer-lease-fail";
+
+    const pointerId = await t.run(async (ctx) => {
+      await ctx.db.insert("config", { managerSlots: 1, workersPerManager: 1 });
+      await ctx.db.insert("managerSlots", {
+        slotNumber: 0,
+        leaseId: "already-owned",
+        leaseExpiry: now + 120_000,
+      });
+      return await ctx.db.insert("queuePointers", {
+        queueId,
+        vestingTime: now,
+        leaseId: pointerLeaseId,
+        leaseExpiry: now + 600_000,
+        lastActiveTime: now,
+      });
+    });
+
+    await t.action(internal.scanner.runManager, {
+      pointerId,
+      queueId,
+      pointerLeaseId,
+      orderBy: "vesting",
+      workersPerManager: 1,
+      slotNumber: 0,
+    });
+
+    const pointer = await t.run(async (ctx) => ctx.db.get(pointerId));
+    expect(pointer?.leaseId).toBeUndefined();
+    expect(pointer?.leaseExpiry).toBeUndefined();
+  });
+
   test("finalizePointer uses FIFO head for next vesting", async () => {
     const t = initConvexTest();
     const queueId = "queue-fifo-pointer";

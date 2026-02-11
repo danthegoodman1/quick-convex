@@ -80,7 +80,7 @@ export type QuickOptions = {
   defaultOrderBy?: QuickOrder;
   retryByDefault?: boolean;
   defaultRetryBehavior?: RetryBehavior;
-  managerBatchSize?: number;
+  workersPerManager?: number;
 };
 
 type OnCompleteRequest<
@@ -189,7 +189,7 @@ export class Quick {
     defaultOrderBy?: QuickOrder;
     retryByDefault?: boolean;
     defaultRetryBehavior?: RetryBehavior;
-    managerBatchSize?: number;
+    workersPerManager?: number;
   };
 
   constructor(
@@ -205,7 +205,7 @@ export class Quick {
       defaultOrderBy?: QuickOrder;
       retryByDefault?: boolean;
       defaultRetryBehavior?: RetryBehavior;
-      managerBatchSize?: number;
+      workersPerManager?: number;
     } = {};
 
     if (options.defaultOrderBy !== undefined) {
@@ -217,8 +217,8 @@ export class Quick {
     if (options.defaultRetryBehavior !== undefined) {
       config.defaultRetryBehavior = options.defaultRetryBehavior;
     }
-    if (options.managerBatchSize !== undefined) {
-      config.managerBatchSize = options.managerBatchSize;
+    if (options.workersPerManager !== undefined) {
+      config.workersPerManager = options.workersPerManager;
     }
 
     this.config = Object.keys(config).length > 0 ? config : undefined;

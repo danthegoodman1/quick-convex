@@ -11,6 +11,7 @@ import type { Id } from "./_generated/dataModel.js"
 import { getRetryDelayMs, isTimeoutError, resolveConfig } from "./lib.js"
 
 const POINTER_OVERSCAN_MULTIPLIER = 5
+const MANAGER_SLOT_LEASE_MS = 600_000
 
 async function wakeScanner(
   ctx: MutationCtx,
@@ -70,7 +71,7 @@ export const claimScannerLease = internalMutation({
   returns: v.object({
     valid: v.boolean(),
     orderBy: v.union(v.literal("vesting"), v.literal("fifo")),
-    managerBatchSize: v.number(),
+    workersPerManager: v.number(),
     hasDuePointers: v.boolean(),
     nextPointerLeased: v.boolean(),
     nextPointerVestingTime: v.union(v.null(), v.number()),
@@ -79,6 +80,7 @@ export const claimScannerLease = internalMutation({
         pointerId: v.id("queuePointers"),
         queueId: v.string(),
         pointerLeaseId: v.string(),
+        slotNumber: v.number(),
       })
     ),
   }),
@@ -92,7 +94,7 @@ export const claimScannerLease = internalMutation({
       return {
         valid: false,
         orderBy: config.defaultOrderBy,
-        managerBatchSize: config.managerBatchSize,
+        workersPerManager: config.workersPerManager,
         hasDuePointers: false,
         nextPointerLeased: false,
         nextPointerVestingTime: null,
@@ -104,7 +106,7 @@ export const claimScannerLease = internalMutation({
       return {
         valid: false,
         orderBy: config.defaultOrderBy,
-        managerBatchSize: config.managerBatchSize,
+        workersPerManager: config.workersPerManager,
         hasDuePointers: false,
         nextPointerLeased: false,
         nextPointerVestingTime: null,
@@ -126,35 +128,80 @@ export const claimScannerLease = internalMutation({
       .withIndex("by_vesting")
       .first()
 
+    const managerSlotsByNumber = new Map<
+      number,
+      {
+        _id: Id<"managerSlots">
+        slotNumber: number
+        leaseExpiry?: number
+      }
+    >()
+
+    for await (const slot of ctx.db
+      .query("managerSlots")
+      .withIndex("by_slot_number", (q) =>
+        q.gte("slotNumber", 0).lt("slotNumber", config.managerSlots)
+      )) {
+      managerSlotsByNumber.set(slot.slotNumber, {
+        _id: slot._id,
+        slotNumber: slot.slotNumber,
+        leaseExpiry: slot.leaseExpiry,
+      })
+    }
+
+    for (let slotNumber = 0; slotNumber < config.managerSlots; slotNumber++) {
+      if (managerSlotsByNumber.has(slotNumber)) {
+        continue
+      }
+      const slotId = await ctx.db.insert("managerSlots", { slotNumber })
+      managerSlotsByNumber.set(slotNumber, {
+        _id: slotId,
+        slotNumber,
+      })
+    }
+
+    const availableSlotNumbers: number[] = []
+    for (let slotNumber = 0; slotNumber < config.managerSlots; slotNumber++) {
+      const slot = managerSlotsByNumber.get(slotNumber)
+      if (!slot) {
+        continue
+      }
+      if (!slot.leaseExpiry || slot.leaseExpiry <= now) {
+        availableSlotNumbers.push(slotNumber)
+      }
+    }
+
     const availablePointers: Array<{
       _id: Id<"queuePointers">
       queueId: string
     }> = []
     const maxPointersToScan =
-      Math.max(config.pointerBatchSize, config.maxConcurrentManagers) *
+      Math.max(config.pointerBatchSize, config.managerSlots) *
       POINTER_OVERSCAN_MULTIPLIER
     let scannedPointers = 0
 
-    for await (const pointer of duePointersQuery()) {
-      scannedPointers++
+    if (availableSlotNumbers.length > 0) {
+      for await (const pointer of duePointersQuery()) {
+        scannedPointers++
 
-      if (pointer.leaseExpiry && pointer.leaseExpiry > now) {
+        if (pointer.leaseExpiry && pointer.leaseExpiry > now) {
+          if (scannedPointers >= maxPointersToScan) {
+            break
+          }
+          continue
+        }
+
+        availablePointers.push({
+          _id: pointer._id,
+          queueId: pointer.queueId,
+        })
+
+        if (availablePointers.length >= availableSlotNumbers.length) {
+          break
+        }
         if (scannedPointers >= maxPointersToScan) {
           break
         }
-        continue
-      }
-
-      availablePointers.push({
-        _id: pointer._id,
-        queueId: pointer.queueId,
-      })
-
-      if (availablePointers.length >= config.maxConcurrentManagers) {
-        break
-      }
-      if (scannedPointers >= maxPointersToScan) {
-        break
       }
     }
 
@@ -162,11 +209,16 @@ export const claimScannerLease = internalMutation({
       pointerId: Id<"queuePointers">
       queueId: string
       pointerLeaseId: string
+      slotNumber: number
     }> = []
 
-    for (const pointer of availablePointers) {
+    for (const [index, pointer] of availablePointers.entries()) {
+      const slotNumber = availableSlotNumbers[index]
+      if (slotNumber === undefined) {
+        break
+      }
       const pointerLeaseId = uuid()
-      const pointerLeaseExpiry = now + config.scannerLeaseDurationMs
+      const pointerLeaseExpiry = now + MANAGER_SLOT_LEASE_MS
 
       await ctx.db.patch(pointer._id, {
         leaseId: pointerLeaseId,
@@ -178,13 +230,14 @@ export const claimScannerLease = internalMutation({
         pointerId: pointer._id,
         queueId: pointer.queueId,
         pointerLeaseId,
+        slotNumber,
       })
     }
 
     return {
       valid: true,
       orderBy: config.defaultOrderBy,
-      managerBatchSize: config.managerBatchSize,
+      workersPerManager: config.workersPerManager,
       hasDuePointers,
       nextPointerLeased:
         nextPointer?.leaseExpiry !== undefined && nextPointer.leaseExpiry > now,
@@ -229,7 +282,8 @@ export const runScanner = internalAction({
           queueId: pointer.queueId,
           pointerLeaseId: pointer.pointerLeaseId,
           orderBy: result.orderBy,
-          managerBatchSize: result.managerBatchSize,
+          workersPerManager: result.workersPerManager,
+          slotNumber: pointer.slotNumber,
         })
       )
     )
@@ -322,58 +376,169 @@ export const rescheduleScanner = internalMutation({
   },
 })
 
+export const tryClaimManagerSlot = internalMutation({
+  args: {
+    slotNumber: v.number(),
+    pointerId: v.id("queuePointers"),
+    pointerLeaseId: v.string(),
+    queueId: v.string(),
+  },
+  returns: v.object({
+    claimed: v.boolean(),
+    slotLeaseId: v.optional(v.string()),
+  }),
+  handler: async (ctx, args) => {
+    const config = await resolveConfig(ctx)
+    if (args.slotNumber < 0 || args.slotNumber >= config.managerSlots) {
+      return { claimed: false }
+    }
+
+    const now = Date.now()
+    const slot = await ctx.db
+      .query("managerSlots")
+      .withIndex("by_slot_number", (q) => q.eq("slotNumber", args.slotNumber))
+      .unique()
+    if (!slot) {
+      return { claimed: false }
+    }
+    if (slot.leaseExpiry && slot.leaseExpiry > now) {
+      return { claimed: false }
+    }
+
+    const pointer = await ctx.db.get(args.pointerId)
+    if (
+      !pointer ||
+      pointer.queueId !== args.queueId ||
+      pointer.leaseId !== args.pointerLeaseId ||
+      (pointer.leaseExpiry !== undefined && pointer.leaseExpiry <= now)
+    ) {
+      return { claimed: false }
+    }
+
+    const slotLeaseId = uuid()
+    await ctx.db.patch(slot._id, {
+      leaseId: slotLeaseId,
+      leaseExpiry: now + MANAGER_SLOT_LEASE_MS,
+      pointerId: args.pointerId,
+      queueId: args.queueId,
+    })
+
+    return { claimed: true, slotLeaseId }
+  },
+})
+
+export const releaseManagerSlot = internalMutation({
+  args: {
+    slotNumber: v.number(),
+    slotLeaseId: v.string(),
+  },
+  returns: v.boolean(),
+  handler: async (ctx, args) => {
+    const slot = await ctx.db
+      .query("managerSlots")
+      .withIndex("by_slot_number", (q) => q.eq("slotNumber", args.slotNumber))
+      .unique()
+    if (!slot || slot.leaseId !== args.slotLeaseId) {
+      return false
+    }
+    await ctx.db.patch(slot._id, {
+      leaseId: undefined,
+      leaseExpiry: undefined,
+      pointerId: undefined,
+      queueId: undefined,
+    })
+    return true
+  },
+})
+
 export const runManager = internalAction({
   args: {
     pointerId: v.id("queuePointers"),
     queueId: v.string(),
     pointerLeaseId: v.string(),
     orderBy: v.union(v.literal("vesting"), v.literal("fifo")),
-    managerBatchSize: v.number(),
+    workersPerManager: v.number(),
+    slotNumber: v.number(),
   },
   handler: async (ctx, args) => {
-    const items = await ctx.runMutation(internal.lib.dequeue, {
+    const slotClaim = await ctx.runMutation(internal.scanner.tryClaimManagerSlot, {
+      slotNumber: args.slotNumber,
+      pointerId: args.pointerId,
+      pointerLeaseId: args.pointerLeaseId,
       queueId: args.queueId,
-      limit: args.managerBatchSize,
-      orderBy: args.orderBy,
     })
 
-    if (items.length === 0) {
+    if (!slotClaim.claimed || !slotClaim.slotLeaseId) {
       await ctx.runMutation(internal.scanner.finalizePointer, {
         pointerId: args.pointerId,
         pointerLeaseId: args.pointerLeaseId,
-        isEmpty: true,
+        isEmpty: false,
         orderBy: args.orderBy,
       })
       return
     }
 
-    await Promise.all(
-      items.map((item) =>
-        (item.item.handlerType ?? "action") === "mutation"
-          ? ctx.scheduler.runAfter(0, internal.scanner.runWorkerMutation, {
-              itemId: item.item._id,
-              leaseId: item.leaseId,
-              handler: item.item.handler,
-              payload: item.item.payload,
-              queueId: args.queueId,
-            })
-          : ctx.scheduler.runAfter(0, internal.scanner.runWorkerAction, {
-              itemId: item.item._id,
-              leaseId: item.leaseId,
-              handler: item.item.handler,
-              handlerType: item.item.handlerType ?? "action",
-              payload: item.item.payload,
-              queueId: args.queueId,
-            })
-      )
-    )
+    let pointerFinalized = false
+    try {
+      const items = await ctx.runMutation(internal.lib.dequeue, {
+        queueId: args.queueId,
+        limit: args.workersPerManager,
+        orderBy: args.orderBy,
+      })
 
-    await ctx.runMutation(internal.scanner.finalizePointer, {
-      pointerId: args.pointerId,
-      pointerLeaseId: args.pointerLeaseId,
-      isEmpty: false,
-      orderBy: args.orderBy,
-    })
+      if (items.length === 0) {
+        await ctx.runMutation(internal.scanner.finalizePointer, {
+          pointerId: args.pointerId,
+          pointerLeaseId: args.pointerLeaseId,
+          isEmpty: true,
+          orderBy: args.orderBy,
+        })
+        pointerFinalized = true
+        return
+      }
+
+      await Promise.allSettled(
+        items.map((item) =>
+          (item.item.handlerType ?? "action") === "mutation"
+            ? ctx.runMutation(internal.scanner.runWorkerMutation, {
+                itemId: item.item._id,
+                leaseId: item.leaseId,
+                handler: item.item.handler,
+                payload: item.item.payload,
+                queueId: args.queueId,
+              })
+            : ctx.runAction(internal.scanner.runWorkerAction, {
+                itemId: item.item._id,
+                leaseId: item.leaseId,
+                handler: item.item.handler,
+                handlerType: item.item.handlerType ?? "action",
+                payload: item.item.payload,
+                queueId: args.queueId,
+              })
+        )
+      )
+
+      await ctx.runMutation(internal.scanner.finalizePointer, {
+        pointerId: args.pointerId,
+        pointerLeaseId: args.pointerLeaseId,
+        isEmpty: false,
+        orderBy: args.orderBy,
+      })
+      pointerFinalized = true
+    } finally {
+      if (!pointerFinalized) {
+        await ctx.runMutation(internal.scanner.finalizePointer, {
+          pointerId: args.pointerId,
+          pointerLeaseId: args.pointerLeaseId,
+          isEmpty: false,
+          orderBy: args.orderBy,
+        })
+      }
+      await ctx.runMutation(internal.scanner.releaseManagerSlot, {
+        slotNumber: args.slotNumber,
+        slotLeaseId: slotClaim.slotLeaseId,
+      })
+    }
   },
 })
 

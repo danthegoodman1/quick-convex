@@ -53,8 +53,8 @@ const resolvedConfigValidator = v.object({
   scannerBackoffMinMs: v.number(),
   scannerBackoffMaxMs: v.number(),
   pointerBatchSize: v.number(),
-  maxConcurrentManagers: v.number(),
-  managerBatchSize: v.number(),
+  managerSlots: v.number(),
+  workersPerManager: v.number(),
   defaultOrderBy: v.union(v.literal("vesting"), v.literal("fifo")),
   defaultLeaseDurationMs: v.number(),
   minInactiveBeforeDeleteMs: v.number(),
@@ -67,8 +67,8 @@ export type ResolvedConfig = {
   scannerBackoffMinMs: number
   scannerBackoffMaxMs: number
   pointerBatchSize: number
-  maxConcurrentManagers: number
-  managerBatchSize: number
+  managerSlots: number
+  workersPerManager: number
   defaultOrderBy: QueueOrder
   defaultLeaseDurationMs: number
   minInactiveBeforeDeleteMs: number
@@ -81,8 +81,8 @@ const CONFIG_DEFAULTS: ResolvedConfig = {
   scannerBackoffMinMs: 100,
   scannerBackoffMaxMs: 5_000,
   pointerBatchSize: 50,
-  maxConcurrentManagers: 10,
-  managerBatchSize: 10,
+  managerSlots: 10,
+  workersPerManager: 10,
   defaultOrderBy: DEFAULT_ORDER_BY,
   defaultLeaseDurationMs: DEFAULT_LEASE_DURATION_MS,
   minInactiveBeforeDeleteMs: MIN_INACTIVE_BEFORE_DELETE_MS,
@@ -97,8 +97,8 @@ function applyConfigDefaults(partial: Partial<Config> | null | undefined): Resol
     scannerBackoffMinMs: partial.scannerBackoffMinMs ?? CONFIG_DEFAULTS.scannerBackoffMinMs,
     scannerBackoffMaxMs: partial.scannerBackoffMaxMs ?? CONFIG_DEFAULTS.scannerBackoffMaxMs,
     pointerBatchSize: partial.pointerBatchSize ?? CONFIG_DEFAULTS.pointerBatchSize,
-    maxConcurrentManagers: partial.maxConcurrentManagers ?? CONFIG_DEFAULTS.maxConcurrentManagers,
-    managerBatchSize: partial.managerBatchSize ?? CONFIG_DEFAULTS.managerBatchSize,
+    managerSlots: partial.managerSlots ?? CONFIG_DEFAULTS.managerSlots,
+    workersPerManager: partial.workersPerManager ?? CONFIG_DEFAULTS.workersPerManager,
     defaultOrderBy: partial.defaultOrderBy ?? CONFIG_DEFAULTS.defaultOrderBy,
     defaultLeaseDurationMs: partial.defaultLeaseDurationMs ?? CONFIG_DEFAULTS.defaultLeaseDurationMs,
     minInactiveBeforeDeleteMs: partial.minInactiveBeforeDeleteMs ?? CONFIG_DEFAULTS.minInactiveBeforeDeleteMs,

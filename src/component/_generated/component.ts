@@ -36,14 +36,14 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
               initialBackoffMs: number;
               maxAttempts: number;
             };
-            managerBatchSize?: number;
-            maxConcurrentManagers?: number;
+            managerSlots?: number;
             minInactiveBeforeDeleteMs?: number;
             pointerBatchSize?: number;
             retryByDefault?: boolean;
             scannerBackoffMaxMs?: number;
             scannerBackoffMinMs?: number;
             scannerLeaseDurationMs?: number;
+            workersPerManager?: number;
           };
           handler: string;
           handlerType?: "action" | "mutation";
@@ -75,14 +75,14 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
               initialBackoffMs: number;
               maxAttempts: number;
             };
-            managerBatchSize?: number;
-            maxConcurrentManagers?: number;
+            managerSlots?: number;
             minInactiveBeforeDeleteMs?: number;
             pointerBatchSize?: number;
             retryByDefault?: boolean;
             scannerBackoffMaxMs?: number;
             scannerBackoffMinMs?: number;
             scannerLeaseDurationMs?: number;
+            workersPerManager?: number;
           };
           items: Array<{
             handler: string;

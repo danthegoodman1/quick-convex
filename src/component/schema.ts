@@ -41,6 +41,16 @@ export default defineSchema({
     .index("by_vesting", ["vestingTime"])
     .index("by_queue", ["queueId"]),
 
+  managerSlots: defineTable({
+    slotNumber: v.number(),
+    leaseId: v.optional(v.string()),
+    leaseExpiry: v.optional(v.number()),
+    pointerId: v.optional(v.id("queuePointers")),
+    queueId: v.optional(v.string()),
+  })
+    .index("by_slot_number", ["slotNumber"])
+    .index("by_lease_expiry", ["leaseExpiry"]),
+
   scannerState: defineTable({
     leaseId: v.optional(v.string()),
     leaseExpiry: v.optional(v.number()),
@@ -53,8 +63,8 @@ export default defineSchema({
     scannerBackoffMinMs: v.optional(v.number()),
     scannerBackoffMaxMs: v.optional(v.number()),
     pointerBatchSize: v.optional(v.number()),
-    maxConcurrentManagers: v.optional(v.number()),
-    managerBatchSize: v.optional(v.number()),
+    managerSlots: v.optional(v.number()),
+    workersPerManager: v.optional(v.number()),
     defaultOrderBy: v.optional(v.union(v.literal("vesting"), v.literal("fifo"))),
     defaultLeaseDurationMs: v.optional(v.number()),
     minInactiveBeforeDeleteMs: v.optional(v.number()),
