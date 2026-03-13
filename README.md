@@ -113,10 +113,10 @@ export const enqueueBatch = mutation({
 });
 ```
 
-### Guaranteed onComplete callback
+### Retried onComplete callback
 
 `onComplete` is always a mutation handle and runs for both action and mutation workers.
-Quick persists completion state (`phase: "onComplete"`) and resumes there after crashes, so completion handlers are retried safely.
+Quick persists completion state (`phase: "onComplete"`) and resumes there after crashes, so completion handlers are retried safely up to 2 times.
 
 ```ts
 import { vOnCompleteArgs } from "@danthegoodman/quick-convex";
@@ -166,10 +166,9 @@ export const enqueueEmail = mutation({
 ### Choosing an ordering mode
 
 - Use `"vesting"` when throughput is the priority. Ready items can run as soon as they are due, so delayed/retried items do not block newer ready work in the same queue.
-- Use `"fifo"` when strict per-`queueId` ordering is required. This enforces head-of-line semantics for that ordering domain.
-- In `"fifo"` mode, a delayed/retrying head item stalls the rest of that same `queueId` until it is ready again.
+- Use `"fifo"` when strict per-`queueId` ordering is required. This enforces head-of-line semantics for that ordering domain. In `"fifo"` mode, a delayed/retrying head item stalls the rest of that same `queueId` until it is ready again.
 
-In practice, FIFO queues are often a cleaner and more performant alternative to creating many `maxParallelism: 1` workpools (one per ordering domain). With Quick FIFO, use `queueId` as the domain key (for example `userId`, `accountId`, or `aggregateId`), and each domain stays ordered while different domains can still process in parallel.
+In practice, FIFO queues are often a cleaner and more performant alternative to creating many `maxParallelism: 1` workpools (one per ordering domain). With Quick FIFO, use `queueId` as the domain key (for example a user id, account id, or aggregate id), and each domain (`queueId` value) stays ordered while different domains can still process in parallel.
 
 ## Compare to Convex Workpools
 
