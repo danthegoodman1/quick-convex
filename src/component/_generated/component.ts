@@ -50,6 +50,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
           onCompleteContext?: any;
           onCompleteHandler?: string;
           payload: any;
+          priority?: number;
           queueId: string;
           retry?: boolean;
           retryBehavior?: {
@@ -90,6 +91,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
             onCompleteContext?: any;
             onCompleteHandler?: string;
             payload: any;
+            priority?: number;
             queueId: string;
             retry?: boolean;
             retryBehavior?: {

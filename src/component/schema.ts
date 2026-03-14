@@ -4,6 +4,7 @@ import { v } from "convex/values"
 export default defineSchema({
   queueItems: defineTable({
     queueId: v.string(),
+    priority: v.number(),
     payload: v.any(),
     handler: v.string(),
     handlerType: v.optional(v.union(v.literal("action"), v.literal("mutation"))),
@@ -28,11 +29,12 @@ export default defineSchema({
     leaseExpiry: v.optional(v.number()),
     errorCount: v.number(),
   })
-    .index("by_queue_and_vesting_time", ["queueId", "vestingTime"])
+    .index("by_queue_priority_and_vesting_time", ["queueId", "priority", "vestingTime"])
     .index("by_queue_fifo", ["queueId"]),
 
   queuePointers: defineTable({
     queueId: v.string(),
+    priority: v.number(),
     vestingTime: v.number(),
     leaseId: v.optional(v.string()),
     leaseExpiry: v.optional(v.number()),
