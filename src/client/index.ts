@@ -95,6 +95,7 @@ export type EnqueueActionRequest<
   OnCompleteFn extends OnCompleteMutationRef<any> = OnCompleteMutationRef<any>,
 > = {
   queueId: string;
+  priority?: number;
   fn: Fn;
   args: WorkerPayload<Fn>;
   runAfter?: number;
@@ -108,6 +109,7 @@ export type EnqueueMutationRequest<
   OnCompleteFn extends OnCompleteMutationRef<any> = OnCompleteMutationRef<any>,
 > = {
   queueId: string;
+  priority?: number;
   fn: Fn;
   args: WorkerPayload<Fn>;
   runAfter?: number;
@@ -128,6 +130,7 @@ export type EnqueueBatchMutationItem<
 
 type BatchInputItem<TRef extends FunctionReference<any, any, any>> = {
   queueId: string;
+  priority?: number;
   fn: TRef;
   args: unknown;
   runAfter?: number;
@@ -141,6 +144,7 @@ type NormalizedBatchItem<TItem> = TItem extends BatchInputItem<
 >
   ? {
       queueId: string;
+      priority?: number;
       fn: TRef;
       args: WorkerPayload<TRef>;
       runAfter?: number;
@@ -268,6 +272,7 @@ export class Quick {
     ctx: QuickCtx,
     request: {
       queueId: string;
+      priority?: number;
       fn: Fn;
       args: WorkerPayload<Fn>;
       runAfter?: number;
@@ -285,6 +290,7 @@ export class Quick {
 
     return await ctx.runMutation(this.component.lib.enqueue, {
       queueId: request.queueId,
+      priority: request.priority,
       payload: request.args,
       handler: handle,
       handlerType,
@@ -303,6 +309,7 @@ export class Quick {
     ctx: QuickCtx,
     items: ReadonlyArray<{
       queueId: string;
+      priority?: number;
       fn: Fn;
       args: WorkerPayload<Fn>;
       runAfter?: number;
@@ -337,6 +344,7 @@ export class Quick {
       const retry = normalizeRetryOption(item.retry);
       mappedItems.push({
         queueId: item.queueId,
+        priority: item.priority,
         payload: item.args,
         handler: handle,
         handlerType,

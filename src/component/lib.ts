@@ -20,6 +20,13 @@ const MIN_INACTIVE_BEFORE_DELETE_MS = 60_000
 const DEFAULT_ORDER_BY: QueueOrder = "vesting"
 const DEFAULT_RETRY_BY_DEFAULT = false
 const DEFAULT_ON_COMPLETE_TIMEOUT_RETRIES = 2
+const MIN_PRIORITY = 0
+export const DEFAULT_PRIORITY = 0
+export const MAX_PRIORITY = 15
+export const PRIORITY_LEVELS_DESC = Array.from(
+  { length: MAX_PRIORITY - MIN_PRIORITY + 1 },
+  (_, index) => MAX_PRIORITY - index
+)
 
 export const retryBehaviorValidator = v.object({
   maxAttempts: v.number(),
@@ -74,6 +81,11 @@ export type ResolvedConfig = {
   minInactiveBeforeDeleteMs: number
   retryByDefault: boolean
   defaultRetryBehavior: RetryBehavior
+}
+
+type PointerState = {
+  priority: number
+  vestingTime: number
 }
 
 const CONFIG_DEFAULTS: ResolvedConfig = {
@@ -132,6 +144,214 @@ function resolveVestingTime(
   }
 
   return now
+}
+
+export function normalizePriority(priority: number | undefined): number {
+  const resolved = priority ?? DEFAULT_PRIORITY
+
+  if (
+    !Number.isInteger(resolved) ||
+    resolved < MIN_PRIORITY ||
+    resolved > MAX_PRIORITY
+  ) {
+    throw new Error(
+      `priority must be an integer between ${MIN_PRIORITY} and ${MAX_PRIORITY}`
+    )
+  }
+
+  return resolved
+}
+
+function isItemReadyAt(
+  item: typeof queueItemValidator.type,
+  now: number
+): boolean {
+  return item.vestingTime <= now && (!item.leaseExpiry || item.leaseExpiry <= now)
+}
+
+function compareReadyPointerStates(a: PointerState, b: PointerState): number {
+  if (a.priority !== b.priority) {
+    return b.priority - a.priority
+  }
+  if (a.vestingTime !== b.vestingTime) {
+    return a.vestingTime - b.vestingTime
+  }
+  return 0
+}
+
+function shouldPromotePointerState(
+  current: PointerState,
+  candidate: PointerState,
+  now: number
+): boolean {
+  const currentReady = current.vestingTime <= now
+  const candidateReady = candidate.vestingTime <= now
+
+  if (candidateReady && !currentReady) {
+    return true
+  }
+
+  if (!candidateReady && currentReady) {
+    return false
+  }
+
+  if (!candidateReady && !currentReady) {
+    return candidate.vestingTime < current.vestingTime
+  }
+
+  return compareReadyPointerStates(candidate, current) < 0
+}
+
+function getPointerCandidateForItem(
+  item: {
+    priority: number
+    vestingTime: number
+  },
+  now: number
+): PointerState {
+  if (item.vestingTime <= now) {
+    return {
+      priority: item.priority,
+      vestingTime: item.vestingTime,
+    }
+  }
+
+  return {
+    priority: DEFAULT_PRIORITY,
+    vestingTime: item.vestingTime,
+  }
+}
+
+async function upsertPointerStateIfBetter(
+  ctx: MutationCtx,
+  args: {
+    queueId: string
+    candidate: PointerState
+    now: number
+  }
+) {
+  const pointer = await ctx.db
+    .query("queuePointers")
+    .withIndex("by_queue", (q) => q.eq("queueId", args.queueId))
+    .unique()
+
+  if (!pointer) {
+    await ctx.db.insert("queuePointers", {
+      queueId: args.queueId,
+      priority: args.candidate.priority,
+      vestingTime: args.candidate.vestingTime,
+      lastActiveTime: args.now,
+    })
+    await ctx.scheduler.runAfter(0, internal.scanner.tryWakeScanner, {})
+    return
+  }
+
+  if (pointer.leaseExpiry && pointer.leaseExpiry > args.now) {
+    return
+  }
+
+  if (
+    !shouldPromotePointerState(
+      {
+        priority: pointer.priority,
+        vestingTime: pointer.vestingTime,
+      },
+      args.candidate,
+      args.now
+    )
+  ) {
+    return
+  }
+
+  await ctx.db.patch(pointer._id, {
+    priority: args.candidate.priority,
+    vestingTime: args.candidate.vestingTime,
+    lastActiveTime: args.now,
+  })
+  await ctx.scheduler.runAfter(0, internal.scanner.tryWakeScanner, {})
+}
+
+async function ensureQueuePointer(
+  ctx: MutationCtx,
+  args: {
+    queueId: string
+    vestingTime: number
+    now: number
+  }
+) {
+  const pointer = await ctx.db
+    .query("queuePointers")
+    .withIndex("by_queue", (q) => q.eq("queueId", args.queueId))
+    .unique()
+
+  if (pointer) {
+    return
+  }
+
+  await ctx.db.insert("queuePointers", {
+    queueId: args.queueId,
+    priority: DEFAULT_PRIORITY,
+    vestingTime: args.vestingTime,
+    lastActiveTime: args.now,
+  })
+  await ctx.scheduler.runAfter(0, internal.scanner.tryWakeScanner, {})
+}
+
+export async function computeVestingPointerState(
+  db: QueryCtx["db"],
+  args: {
+    queueId: string
+    now: number
+  }
+): Promise<{
+  hasItems: boolean
+  state: PointerState | null
+}> {
+  let hasItems = false
+  let earliestFutureVestingTime: number | null = null
+
+  for (const priority of PRIORITY_LEVELS_DESC) {
+    const head = await db
+      .query("queueItems")
+      .withIndex("by_queue_priority_and_vesting_time", (q) =>
+        q.eq("queueId", args.queueId).eq("priority", priority)
+      )
+      .first()
+
+    if (!head) {
+      continue
+    }
+
+    hasItems = true
+
+    if (isItemReadyAt(head, args.now)) {
+      return {
+        hasItems: true,
+        state: {
+          priority,
+          vestingTime: head.vestingTime,
+        },
+      }
+    }
+
+    if (
+      earliestFutureVestingTime === null ||
+      head.vestingTime < earliestFutureVestingTime
+    ) {
+      earliestFutureVestingTime = head.vestingTime
+    }
+  }
+
+  return {
+    hasItems,
+    state:
+      earliestFutureVestingTime === null
+        ? null
+        : {
+            priority: DEFAULT_PRIORITY,
+            vestingTime: earliestFutureVestingTime,
+          },
+  }
 }
 
 export function resolveItemRetryPolicy(
@@ -235,28 +455,22 @@ async function resolveAndMaybeUpdateConfig(
   return applyConfigDefaults(merged)
 }
 
-export const updatePointerVesting = internalMutation({
+export const updatePointerState = internalMutation({
   args: {
     queueId: v.string(),
+    priority: v.number(),
     vestingTime: v.number(),
   },
   returns: v.null(),
   handler: async (ctx, args) => {
-    const now = Date.now()
-
-    const pointer = await ctx.db
-      .query("queuePointers")
-      .withIndex("by_queue", (q) => q.eq("queueId", args.queueId))
-      .unique()
-
-    if (pointer && args.vestingTime < pointer.vestingTime) {
-      await ctx.db.patch(pointer._id, {
+    await upsertPointerStateIfBetter(ctx, {
+      queueId: args.queueId,
+      candidate: {
+        priority: normalizePriority(args.priority),
         vestingTime: args.vestingTime,
-        lastActiveTime: now,
-      })
-      await ctx.scheduler.runAfter(0, internal.scanner.tryWakeScanner, {})
-    }
-
+      },
+      now: Date.now(),
+    })
     return null
   },
 })
@@ -264,6 +478,7 @@ export const updatePointerVesting = internalMutation({
 export const enqueue = mutation({
   args: {
     queueId: v.string(),
+    priority: v.optional(v.number()),
     payload: v.any(),
     handler: v.string(),
     handlerType: v.optional(v.union(v.literal("action"), v.literal("mutation"))),
@@ -283,6 +498,7 @@ export const enqueue = mutation({
     const resolvedConfig = await resolveConfig(ctx)
     const now = Date.now()
     const vestingTime = resolveVestingTime(now, args)
+    const priority = normalizePriority(args.priority)
     const retryPolicy = resolveItemRetryPolicy(resolvedConfig, {
       retry: args.retry,
       retryBehavior: args.retryBehavior,
@@ -290,6 +506,7 @@ export const enqueue = mutation({
 
     const itemId = await ctx.db.insert("queueItems", {
       queueId: args.queueId,
+      priority,
       payload: args.payload,
       handler: args.handler,
       handlerType: args.handlerType ?? "action",
@@ -302,25 +519,18 @@ export const enqueue = mutation({
       errorCount: 0,
     })
 
-    const existingPointer = await ctx.db
-      .query("queuePointers")
-      .withIndex("by_queue", (q) => q.eq("queueId", args.queueId))
-      .unique()
-
-    if (existingPointer) {
-      if (vestingTime < existingPointer.vestingTime) {
-        await ctx.scheduler.runAfter(0, internal.lib.updatePointerVesting, {
-          queueId: args.queueId,
-          vestingTime,
-        })
-      }
+    if (resolvedConfig.defaultOrderBy === "vesting") {
+      await upsertPointerStateIfBetter(ctx, {
+        queueId: args.queueId,
+        candidate: getPointerCandidateForItem({ priority, vestingTime }, now),
+        now,
+      })
     } else {
-      await ctx.db.insert("queuePointers", {
+      await ensureQueuePointer(ctx, {
         queueId: args.queueId,
         vestingTime,
-        lastActiveTime: now,
+        now,
       })
-      await ctx.scheduler.runAfter(0, internal.scanner.tryWakeScanner, {})
     }
 
     return itemId
@@ -332,6 +542,7 @@ export const enqueueBatch = mutation({
     items: v.array(
       v.object({
         queueId: v.string(),
+        priority: v.optional(v.number()),
         payload: v.any(),
         handler: v.string(),
         handlerType: v.optional(v.union(v.literal("action"), v.literal("mutation"))),
@@ -353,13 +564,12 @@ export const enqueueBatch = mutation({
     const resolvedConfig = await resolveConfig(ctx)
     const now = Date.now()
     const itemIds: Array<typeof schema.tables.queueItems.validator.type & { _id: string }> = []
-    const pointerUpdates = new Map<
-      string,
-      { vestingTime: number; lastActiveTime: number }
-    >()
+    const pointerUpdates = new Map<string, PointerState>()
+    const queuesNeedingPointerEnsure = new Map<string, number>()
 
     for (const item of args.items) {
       const vestingTime = resolveVestingTime(now, item)
+      const priority = normalizePriority(item.priority)
       const retryPolicy = resolveItemRetryPolicy(resolvedConfig, {
         retry: item.retry,
         retryBehavior: item.retryBehavior,
@@ -367,6 +577,7 @@ export const enqueueBatch = mutation({
 
       const itemId = await ctx.db.insert("queueItems", {
         queueId: item.queueId,
+        priority,
         payload: item.payload,
         handler: item.handler,
         handlerType: item.handlerType ?? "action",
@@ -381,32 +592,35 @@ export const enqueueBatch = mutation({
 
       itemIds.push(itemId as any)
 
-      const existing = pointerUpdates.get(item.queueId)
-      if (!existing || vestingTime < existing.vestingTime) {
-        pointerUpdates.set(item.queueId, { vestingTime, lastActiveTime: now })
+      if (resolvedConfig.defaultOrderBy === "vesting") {
+        const candidate = getPointerCandidateForItem({ priority, vestingTime }, now)
+        const existing = pointerUpdates.get(item.queueId)
+        if (!existing || shouldPromotePointerState(existing, candidate, now)) {
+          pointerUpdates.set(item.queueId, candidate)
+        }
+      } else {
+        const existingVestingTime = queuesNeedingPointerEnsure.get(item.queueId)
+        if (existingVestingTime === undefined || vestingTime < existingVestingTime) {
+          queuesNeedingPointerEnsure.set(item.queueId, vestingTime)
+        }
       }
     }
 
-    for (const [queueId, update] of pointerUpdates) {
-      const existingPointer = await ctx.db
-        .query("queuePointers")
-        .withIndex("by_queue", (q) => q.eq("queueId", queueId))
-        .unique()
-
-      if (existingPointer) {
-        if (update.vestingTime < existingPointer.vestingTime) {
-          await ctx.scheduler.runAfter(0, internal.lib.updatePointerVesting, {
-            queueId,
-            vestingTime: update.vestingTime,
-          })
-        }
-      } else {
-        await ctx.db.insert("queuePointers", {
+    if (resolvedConfig.defaultOrderBy === "vesting") {
+      for (const [queueId, candidate] of pointerUpdates) {
+        await upsertPointerStateIfBetter(ctx, {
           queueId,
-          vestingTime: update.vestingTime,
-          lastActiveTime: update.lastActiveTime,
+          candidate,
+          now,
         })
-        await ctx.scheduler.runAfter(0, internal.scanner.tryWakeScanner, {})
+      }
+    } else {
+      for (const [queueId, vestingTime] of queuesNeedingPointerEnsure) {
+        await ensureQueuePointer(ctx, {
+          queueId,
+          vestingTime,
+          now,
+        })
       }
     }
 
@@ -428,7 +642,14 @@ export const peekPointers = internalQuery({
       .withIndex("by_vesting", (q) => q.lte("vestingTime", now))
       .take(limit)
 
-    return pointers.filter((p) => !p.leaseExpiry || p.leaseExpiry <= now)
+    return pointers
+      .filter((p) => !p.leaseExpiry || p.leaseExpiry <= now)
+      .sort((a, b) => {
+        if (a.priority !== b.priority) {
+          return b.priority - a.priority
+        }
+        return a.vestingTime - b.vestingTime
+      })
   },
 })
 
@@ -473,46 +694,55 @@ async function collectAvailableItems(
     now: number
   }
 ): Promise<Array<typeof queueItemValidator.type>> {
-  const query =
-    args.orderBy === "fifo"
-      ? db
-          .query("queueItems")
-          .withIndex("by_queue_fifo", (q) => q.eq("queueId", args.queueId))
-      : db
-          .query("queueItems")
-          .withIndex("by_queue_and_vesting_time", (q) =>
-            q.eq("queueId", args.queueId)
-          )
-
   const availableItems: Array<typeof queueItemValidator.type> = []
-  const maxScan = 1000
-  let scanned = 0
 
-  for await (const item of query) {
-    scanned++
+  if (args.orderBy === "fifo") {
+    const query = db
+      .query("queueItems")
+      .withIndex("by_queue_fifo", (q) => q.eq("queueId", args.queueId))
 
-    if (scanned > maxScan) {
-      break
-    }
+    for await (const item of query) {
+      if (item.vestingTime > args.now) {
+        // Strict FIFO: the first future item blocks the queue.
+        break
+      }
 
-    if (item.vestingTime > args.now) {
-      // For vesting order, all later rows are also in the future.
-      // For FIFO, strict head-of-line semantics block on the first future row.
-      break
-    }
-
-    if (item.leaseExpiry && item.leaseExpiry > args.now) {
-      if (args.orderBy === "fifo") {
+      if (item.leaseExpiry && item.leaseExpiry > args.now) {
         // Strict FIFO: do not skip a leased head item.
         break
       }
-      continue
+
+      availableItems.push(item)
+
+      if (availableItems.length >= args.limit) {
+        break
+      }
     }
 
-    availableItems.push(item)
+    return availableItems
+  }
 
-    if (availableItems.length >= args.limit) {
-      break
+  for (const priority of PRIORITY_LEVELS_DESC) {
+    const query = db
+      .query("queueItems")
+      .withIndex("by_queue_priority_and_vesting_time", (q) =>
+        q.eq("queueId", args.queueId).eq("priority", priority)
+      )
+
+    for await (const item of query) {
+      if (item.vestingTime > args.now) {
+        break
+      }
+
+      if (item.leaseExpiry && item.leaseExpiry > args.now) {
+        continue
+      }
+
+      availableItems.push(item)
+
+      if (availableItems.length >= args.limit) {
+        return availableItems
+      }
     }
   }
 
@@ -656,21 +886,16 @@ export const dequeue = internalMutation({
   },
 })
 
-async function schedulePointerWakeIfEarlier(
+async function updatePointerStateIfBetter(
   ctx: MutationCtx,
   queueId: string,
-  vestingTime: number
+  candidate: PointerState
 ) {
-  const pointer = await ctx.db
-    .query("queuePointers")
-    .withIndex("by_queue", (q) => q.eq("queueId", queueId))
-    .unique()
-  if (pointer && vestingTime < pointer.vestingTime) {
-    await ctx.scheduler.runAfter(0, internal.lib.updatePointerVesting, {
-      queueId,
-      vestingTime,
-    })
-  }
+  await upsertPointerStateIfBetter(ctx, {
+    queueId,
+    candidate,
+    now: Date.now(),
+  })
 }
 
 export const prepareActionWorkerExecution = internalMutation({
@@ -727,6 +952,7 @@ async function runOnCompleteForItem(
       timeoutRetries < DEFAULT_ON_COMPLETE_TIMEOUT_RETRIES
     ) {
       const now = Date.now()
+      const config = await resolveConfig(ctx)
       const retryVestingTime = now + 100
       await ctx.db.patch(item._id, {
         onCompleteTimeoutRetries: timeoutRetries + 1,
@@ -734,7 +960,19 @@ async function runOnCompleteForItem(
         leaseId: undefined,
         leaseExpiry: undefined,
       })
-      await schedulePointerWakeIfEarlier(ctx, item.queueId, retryVestingTime)
+      if (config.defaultOrderBy === "vesting") {
+        await updatePointerStateIfBetter(
+          ctx,
+          item.queueId,
+          getPointerCandidateForItem(
+            {
+              priority: item.priority,
+              vestingTime: retryVestingTime,
+            },
+            now
+          )
+        )
+      }
       return { done: false, retriedOnComplete: true }
     }
 
@@ -793,14 +1031,28 @@ export const finalizeActionWorker = internalMutation({
 
       if (retryEnabled && nextErrorCount < maxAttempts) {
         const backoffMs = getRetryDelayMs(retryBehavior, nextErrorCount)
-        const retryVestingTime = Date.now() + backoffMs
+        const now = Date.now()
+        const config = await resolveConfig(ctx)
+        const retryVestingTime = now + backoffMs
         await ctx.db.patch(item._id, {
           errorCount: nextErrorCount,
           vestingTime: retryVestingTime,
           leaseId: undefined,
           leaseExpiry: undefined,
         })
-        await schedulePointerWakeIfEarlier(ctx, item.queueId, retryVestingTime)
+        if (config.defaultOrderBy === "vesting") {
+          await updatePointerStateIfBetter(
+            ctx,
+            item.queueId,
+            getPointerCandidateForItem(
+              {
+                priority: item.priority,
+                vestingTime: retryVestingTime,
+              },
+              now
+            )
+          )
+        }
         return {
           done: false,
           retriedWork: true,
@@ -891,7 +1143,7 @@ export const garbageCollectPointers = internalMutation({
 
       const hasItems = await ctx.db
         .query("queueItems")
-      .withIndex("by_queue_and_vesting_time", (q) =>
+        .withIndex("by_queue_priority_and_vesting_time", (q) =>
           q.eq("queueId", pointer.queueId)
         )
         .first()
@@ -920,7 +1172,7 @@ export const getQueueStats = query({
 
     const items = await ctx.db
       .query("queueItems")
-      .withIndex("by_queue_and_vesting_time", (q) =>
+      .withIndex("by_queue_priority_and_vesting_time", (q) =>
         q.eq("queueId", args.queueId)
       )
       .collect()

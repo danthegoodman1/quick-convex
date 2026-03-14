@@ -8,7 +8,7 @@ import {
 } from "convex/server";
 import { v } from "convex/values";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
-import { internal } from "./_generated/api.js";
+import { api, internal } from "./_generated/api.js";
 import { action, mutation } from "./_generated/server.js";
 import { initConvexTest } from "./setup.test.js";
 
@@ -243,6 +243,7 @@ describe("component runtime execution", () => {
     const probeId = await t.run(async (ctx) =>
       ctx.db.insert("queueItems", {
         queueId: "probe",
+        priority: 0,
         payload: { executedBy: null },
         handler: "probe",
         vestingTime: 0,
@@ -256,6 +257,7 @@ describe("component runtime execution", () => {
     const itemId = await t.run(async (ctx) =>
       ctx.db.insert("queueItems", {
         queueId: "queue-action",
+        priority: 0,
         payload: { probeId },
         handler: handle,
         handlerType: "action",
@@ -286,6 +288,7 @@ describe("component runtime execution", () => {
     const probeId = await t.run(async (ctx) =>
       ctx.db.insert("queueItems", {
         queueId: "probe",
+        priority: 0,
         payload: { executedBy: null },
         handler: "probe",
         vestingTime: 0,
@@ -299,6 +302,7 @@ describe("component runtime execution", () => {
     const itemId = await t.run(async (ctx) =>
       ctx.db.insert("queueItems", {
         queueId: "queue-mutation",
+        priority: 0,
         payload: { probeId },
         handler: handle,
         handlerType: "mutation",
@@ -329,6 +333,7 @@ describe("component runtime execution", () => {
     const completionProbeId = await t.run(async (ctx) =>
       ctx.db.insert("queueItems", {
         queueId: "probe-completion",
+        priority: 0,
         payload: { completion: null },
         handler: "probe",
         vestingTime: 0,
@@ -344,6 +349,7 @@ describe("component runtime execution", () => {
     const itemId = await t.run(async (ctx) =>
       ctx.db.insert("queueItems", {
         queueId: "queue-action-on-complete",
+        priority: 0,
         payload: { probeId: completionProbeId },
         handler: actionHandle,
         handlerType: "action",
@@ -377,6 +383,7 @@ describe("component runtime execution", () => {
     const completionProbeId = await t.run(async (ctx) =>
       ctx.db.insert("queueItems", {
         queueId: "probe-completion",
+        priority: 0,
         payload: { completion: null },
         handler: "probe",
         vestingTime: 0,
@@ -392,6 +399,7 @@ describe("component runtime execution", () => {
     const itemId = await t.run(async (ctx) =>
       ctx.db.insert("queueItems", {
         queueId: "queue-mutation-on-complete",
+        priority: 0,
         payload: { probeId: completionProbeId },
         handler: mutationHandle,
         handlerType: "mutation",
@@ -425,6 +433,7 @@ describe("component runtime execution", () => {
     const completionProbeId = await t.run(async (ctx) =>
       ctx.db.insert("queueItems", {
         queueId: "probe-completion",
+        priority: 0,
         payload: { completion: null },
         handler: "probe",
         vestingTime: 0,
@@ -440,6 +449,7 @@ describe("component runtime execution", () => {
     const itemId = await t.run(async (ctx) =>
       ctx.db.insert("queueItems", {
         queueId,
+        priority: 0,
         payload: { any: "value" },
         handler: failHandle,
         handlerType: "action",
@@ -519,6 +529,7 @@ describe("component runtime execution", () => {
     const workerProbeId = await t.run(async (ctx) =>
       ctx.db.insert("queueItems", {
         queueId: "probe-worker",
+        priority: 0,
         payload: { executedBy: null },
         handler: "probe",
         vestingTime: 0,
@@ -528,6 +539,7 @@ describe("component runtime execution", () => {
     const completionProbeId = await t.run(async (ctx) =>
       ctx.db.insert("queueItems", {
         queueId: "probe-completion",
+        priority: 0,
         payload: { completion: null },
         handler: "probe",
         vestingTime: 0,
@@ -543,6 +555,7 @@ describe("component runtime execution", () => {
     const itemId = await t.run(async (ctx) =>
       ctx.db.insert("queueItems", {
         queueId: "queue-recovery",
+        priority: 0,
         payload: { probeId: workerProbeId },
         handler: actionHandle,
         handlerType: "action",
@@ -583,6 +596,7 @@ describe("component runtime execution", () => {
     const completionProbeId = await t.run(async (ctx) =>
       ctx.db.insert("queueItems", {
         queueId: "probe-timeout",
+        priority: 0,
         payload: { attempts: 0 },
         handler: "probe",
         vestingTime: 0,
@@ -596,6 +610,7 @@ describe("component runtime execution", () => {
     const itemId = await t.run(async (ctx) =>
       ctx.db.insert("queueItems", {
         queueId: "queue-timeout",
+        priority: 0,
         payload: { ignored: true },
         handler: "noop",
         handlerType: "mutation",
@@ -653,6 +668,7 @@ describe("component runtime execution", () => {
     const itemId = await t.run(async (ctx) =>
       ctx.db.insert("queueItems", {
         queueId: "queue-on-complete-fail",
+        priority: 0,
         payload: { ignored: true },
         handler: "noop",
         handlerType: "mutation",
@@ -684,6 +700,7 @@ describe("component runtime execution", () => {
     const probeId = await t.run(async (ctx) =>
       ctx.db.insert("queueItems", {
         queueId: "probe",
+        priority: 0,
         payload: { executedBy: null },
         handler: "probe",
         vestingTime: 0,
@@ -699,6 +716,7 @@ describe("component runtime execution", () => {
     const [firstId, secondId] = await t.run(async (ctx) => {
       const a = await ctx.db.insert("queueItems", {
         queueId,
+        priority: 0,
         payload: { tag: "first" },
         handler: failHandle,
         handlerType: "action",
@@ -707,6 +725,7 @@ describe("component runtime execution", () => {
       });
       const b = await ctx.db.insert("queueItems", {
         queueId,
+        priority: 0,
         payload: { probeId },
         handler: mutationHandle,
         handlerType: "mutation",
@@ -754,6 +773,55 @@ describe("component runtime execution", () => {
     expect(probe?.payload).toEqual({ executedBy: "mutation" });
   });
 
+  test("vesting order prioritizes higher-priority items before lower-priority items", async () => {
+    const t = initConvexTest();
+    const queueId = "queue-priority-order";
+
+    const ids = await t.run(async (ctx) => {
+      const low = await ctx.db.insert("queueItems", {
+        queueId,
+        priority: 1,
+        payload: { tag: "low" },
+        handler: "h-low",
+        handlerType: "action",
+        vestingTime: 0,
+        errorCount: 0,
+      });
+      const highLater = await ctx.db.insert("queueItems", {
+        queueId,
+        priority: 5,
+        payload: { tag: "high-later" },
+        handler: "h-high-later",
+        handlerType: "action",
+        vestingTime: 10,
+        errorCount: 0,
+      });
+      const highEarlier = await ctx.db.insert("queueItems", {
+        queueId,
+        priority: 5,
+        payload: { tag: "high-earlier" },
+        handler: "h-high-earlier",
+        handlerType: "action",
+        vestingTime: 0,
+        errorCount: 0,
+      });
+
+      return { low, highEarlier, highLater };
+    });
+
+    const leased = await t.mutation(internal.lib.dequeue, {
+      queueId,
+      limit: 3,
+      orderBy: "vesting",
+    });
+
+    expect(leased.map((entry) => entry.item._id)).toEqual([
+      ids.highEarlier,
+      ids.highLater,
+      ids.low,
+    ]);
+  });
+
   test("fifo order blocks later ready items behind delayed head", async () => {
     const t = initConvexTest();
     const queueId = "queue-fifo";
@@ -765,6 +833,7 @@ describe("component runtime execution", () => {
     const [firstId] = await t.run(async (ctx) => {
       const a = await ctx.db.insert("queueItems", {
         queueId,
+        priority: 0,
         payload: { tag: "first" },
         handler: failHandle,
         handlerType: "action",
@@ -779,6 +848,7 @@ describe("component runtime execution", () => {
       });
       await ctx.db.insert("queueItems", {
         queueId,
+        priority: 0,
         payload: { tag: "second" },
         handler: failHandle,
         handlerType: "action",
@@ -819,6 +889,19 @@ describe("component runtime execution", () => {
     expect(secondLease).toHaveLength(0);
   });
 
+  test("enqueue rejects priorities outside the supported range", async () => {
+    const t = initConvexTest();
+
+    await expect(
+      t.mutation(api.lib.enqueue, {
+        queueId: "queue-invalid-priority",
+        priority: 16,
+        payload: { any: "value" },
+        handler: "noop",
+      }),
+    ).rejects.toThrow("priority must be an integer between 0 and 15");
+  });
+
   test("claimScannerLease is bounded by available manager slots", async () => {
     const t = initConvexTest();
     const now = Date.now();
@@ -838,11 +921,13 @@ describe("component runtime execution", () => {
       });
       await ctx.db.insert("queuePointers", {
         queueId: "queue-slot-a",
+        priority: 0,
         vestingTime: now - 1_000,
         lastActiveTime: now,
       });
       await ctx.db.insert("queuePointers", {
         queueId: "queue-slot-b",
+        priority: 0,
         vestingTime: now - 1_000,
         lastActiveTime: now,
       });
@@ -868,6 +953,46 @@ describe("component runtime execution", () => {
     expect(slots.map((slot) => slot.slotNumber)).toEqual([0, 1]);
   });
 
+  test("claimScannerLease prefers higher-priority due pointers in vesting mode", async () => {
+    const t = initConvexTest();
+    const now = Date.now();
+    const scannerLeaseId = "scanner-priority-lease";
+
+    await t.run(async (ctx) => {
+      await ctx.db.insert("config", {
+        defaultOrderBy: "vesting",
+        managerSlots: 1,
+        workersPerManager: 1,
+        pointerBatchSize: 10,
+      });
+      await ctx.db.insert("queuePointers", {
+        queueId: "queue-low-priority",
+        priority: 1,
+        vestingTime: now - 1_000,
+        lastActiveTime: now,
+      });
+      await ctx.db.insert("queuePointers", {
+        queueId: "queue-high-priority",
+        priority: 12,
+        vestingTime: now - 1_000,
+        lastActiveTime: now,
+      });
+      await ctx.db.insert("scannerState", {
+        leaseId: scannerLeaseId,
+        leaseExpiry: now + 5_000,
+        lastRunAt: now,
+      });
+    });
+
+    const result = await t.mutation(internal.scanner.claimScannerLease, {
+      leaseId: scannerLeaseId,
+    });
+
+    expect(result.valid).toBe(true);
+    expect(result.pointers).toHaveLength(1);
+    expect(result.pointers[0].queueId).toBe("queue-high-priority");
+  });
+
   test("tryClaimManagerSlot claims and releases slot ownership", async () => {
     const t = initConvexTest();
     const now = Date.now();
@@ -878,6 +1003,7 @@ describe("component runtime execution", () => {
       await ctx.db.insert("managerSlots", { slotNumber: 0 });
       return await ctx.db.insert("queuePointers", {
         queueId: "queue-slot-claim",
+        priority: 0,
         vestingTime: now,
         leaseId: pointerLeaseId,
         leaseExpiry: now + 600_000,
@@ -943,6 +1069,7 @@ describe("component runtime execution", () => {
     const probeId = await t.run(async (ctx) =>
       ctx.db.insert("queueItems", {
         queueId: "probe",
+        priority: 0,
         payload: { executedBy: null },
         handler: "probe",
         vestingTime: 0,
@@ -963,6 +1090,7 @@ describe("component runtime execution", () => {
 
       const pointerId = await ctx.db.insert("queuePointers", {
         queueId,
+        priority: 0,
         vestingTime: now,
         leaseId: pointerLeaseId,
         leaseExpiry: now + 600_000,
@@ -970,6 +1098,7 @@ describe("component runtime execution", () => {
       });
       const itemId = await ctx.db.insert("queueItems", {
         queueId,
+        priority: 0,
         payload: { probeId },
         handler: mutationHandle,
         handlerType: "mutation",
@@ -1023,6 +1152,7 @@ describe("component runtime execution", () => {
       });
       return await ctx.db.insert("queuePointers", {
         queueId,
+        priority: 0,
         vestingTime: now,
         leaseId: pointerLeaseId,
         leaseExpiry: now + 600_000,
@@ -1053,6 +1183,7 @@ describe("component runtime execution", () => {
     const pointerId = await t.run(async (ctx) => {
       await ctx.db.insert("queueItems", {
         queueId,
+        priority: 0,
         payload: { tag: "head-delayed" },
         handler: "h1",
         handlerType: "action",
@@ -1061,6 +1192,7 @@ describe("component runtime execution", () => {
       });
       await ctx.db.insert("queueItems", {
         queueId,
+        priority: 0,
         payload: { tag: "later-ready" },
         handler: "h2",
         handlerType: "action",
@@ -1070,6 +1202,7 @@ describe("component runtime execution", () => {
 
       return await ctx.db.insert("queuePointers", {
         queueId,
+        priority: 0,
         vestingTime: now,
         leaseId: "pointer-lease",
         leaseExpiry: now + 30_000,
@@ -1089,6 +1222,111 @@ describe("component runtime execution", () => {
     expect(pointer?.vestingTime).toBe(delayedHeadVesting);
   });
 
+  test("finalizePointer keeps pointer priority when the same tier still has ready work", async () => {
+    const t = initConvexTest();
+    const queueId = "queue-priority-pointer-stays-high";
+    const now = Date.now();
+
+    const pointerId = await t.run(async (ctx) => {
+      const processedHighId = await ctx.db.insert("queueItems", {
+        queueId,
+        priority: 15,
+        payload: { tag: "processed-high" },
+        handler: "h-processed",
+        handlerType: "action",
+        vestingTime: now - 2_000,
+        errorCount: 0,
+      });
+      await ctx.db.insert("queueItems", {
+        queueId,
+        priority: 15,
+        payload: { tag: "remaining-high" },
+        handler: "h-remaining",
+        handlerType: "action",
+        vestingTime: now - 1_000,
+        errorCount: 0,
+      });
+      await ctx.db.insert("queueItems", {
+        queueId,
+        priority: 3,
+        payload: { tag: "remaining-low" },
+        handler: "h-low",
+        handlerType: "action",
+        vestingTime: now - 500,
+        errorCount: 0,
+      });
+      const pointerId = await ctx.db.insert("queuePointers", {
+        queueId,
+        priority: 15,
+        vestingTime: now - 2_000,
+        leaseId: "pointer-lease-high",
+        leaseExpiry: now + 30_000,
+        lastActiveTime: now,
+      });
+      await ctx.db.delete(processedHighId);
+      return pointerId;
+    });
+
+    await t.mutation(internal.scanner.finalizePointer, {
+      pointerId,
+      pointerLeaseId: "pointer-lease-high",
+      isEmpty: false,
+      orderBy: "vesting",
+    });
+
+    const pointer = await t.run(async (ctx) => ctx.db.get(pointerId));
+    expect(pointer).not.toBeNull();
+    expect(pointer?.priority).toBe(15);
+  });
+
+  test("finalizePointer demotes pointer priority when the higher tier is exhausted", async () => {
+    const t = initConvexTest();
+    const queueId = "queue-priority-pointer-demotes";
+    const now = Date.now();
+
+    const pointerId = await t.run(async (ctx) => {
+      const processedHighId = await ctx.db.insert("queueItems", {
+        queueId,
+        priority: 15,
+        payload: { tag: "processed-high" },
+        handler: "h-processed",
+        handlerType: "action",
+        vestingTime: now - 2_000,
+        errorCount: 0,
+      });
+      await ctx.db.insert("queueItems", {
+        queueId,
+        priority: 4,
+        payload: { tag: "remaining-low" },
+        handler: "h-low",
+        handlerType: "action",
+        vestingTime: now - 1_000,
+        errorCount: 0,
+      });
+      const pointerId = await ctx.db.insert("queuePointers", {
+        queueId,
+        priority: 15,
+        vestingTime: now - 2_000,
+        leaseId: "pointer-lease-demote",
+        leaseExpiry: now + 30_000,
+        lastActiveTime: now,
+      });
+      await ctx.db.delete(processedHighId);
+      return pointerId;
+    });
+
+    await t.mutation(internal.scanner.finalizePointer, {
+      pointerId,
+      pointerLeaseId: "pointer-lease-demote",
+      isEmpty: false,
+      orderBy: "vesting",
+    });
+
+    const pointer = await t.run(async (ctx) => ctx.db.get(pointerId));
+    expect(pointer).not.toBeNull();
+    expect(pointer?.priority).toBe(4);
+  });
+
   test("finalizePointer parks empty queues to avoid pointer hot-loop", async () => {
     const t = initConvexTest();
     const queueId = "queue-empty-pointer";
@@ -1099,6 +1337,7 @@ describe("component runtime execution", () => {
       await ctx.db.insert("config", { minInactiveBeforeDeleteMs });
       return await ctx.db.insert("queuePointers", {
         queueId,
+        priority: 0,
         vestingTime: now,
         leaseId: "pointer-lease",
         leaseExpiry: now + 30_000,

@@ -14,6 +14,7 @@ describe("async iterator", () => {
     await t.run(async (ctx) => {
       await ctx.db.insert("queueItems", {
         queueId,
+        priority: 0,
         payload: { value: 1 },
         handler: "testHandler",
         vestingTime: 500, // before now
@@ -21,6 +22,7 @@ describe("async iterator", () => {
       })
       await ctx.db.insert("queueItems", {
         queueId,
+        priority: 0,
         payload: { value: 2 },
         handler: "testHandler",
         vestingTime: 800, // before now
@@ -28,6 +30,7 @@ describe("async iterator", () => {
       })
       await ctx.db.insert("queueItems", {
         queueId,
+        priority: 0,
         payload: { value: 3 },
         handler: "testHandler",
         vestingTime: 1500, // after now - should break

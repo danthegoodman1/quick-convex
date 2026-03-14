@@ -8,7 +8,13 @@ import {
 } from "./_generated/server.js"
 import { internal } from "./_generated/api.js"
 import type { Id } from "./_generated/dataModel.js"
-import { getRetryDelayMs, isTimeoutError, resolveConfig } from "./lib.js"
+import {
+  DEFAULT_PRIORITY,
+  computeVestingPointerState,
+  getRetryDelayMs,
+  isTimeoutError,
+  resolveConfig,
+} from "./lib.js"
 
 const POINTER_OVERSCAN_MULTIPLIER = 5
 const MANAGER_SLOT_LEASE_MS = 600_000
@@ -174,6 +180,8 @@ export const claimScannerLease = internalMutation({
     const availablePointers: Array<{
       _id: Id<"queuePointers">
       queueId: string
+      priority: number
+      vestingTime: number
     }> = []
     const maxPointersToScan =
       Math.max(config.pointerBatchSize, config.managerSlots) *
@@ -194,16 +202,22 @@ export const claimScannerLease = internalMutation({
         availablePointers.push({
           _id: pointer._id,
           queueId: pointer.queueId,
+          priority: pointer.priority,
+          vestingTime: pointer.vestingTime,
         })
 
-        if (availablePointers.length >= availableSlotNumbers.length) {
-          break
-        }
         if (scannedPointers >= maxPointersToScan) {
           break
         }
       }
     }
+
+    availablePointers.sort((a, b) => {
+      if (config.defaultOrderBy === "vesting" && a.priority !== b.priority) {
+        return b.priority - a.priority
+      }
+      return a.vestingTime - b.vestingTime
+    })
 
     const claimedPointers: Array<{
       pointerId: Id<"queuePointers">
@@ -212,7 +226,9 @@ export const claimScannerLease = internalMutation({
       slotNumber: number
     }> = []
 
-    for (const [index, pointer] of availablePointers.entries()) {
+    for (const [index, pointer] of availablePointers
+      .slice(0, availableSlotNumbers.length)
+      .entries()) {
       const slotNumber = availableSlotNumbers[index]
       if (slotNumber === undefined) {
         break
@@ -563,53 +579,67 @@ export const finalizePointer = internalMutation({
       return null
     }
 
-    const nextItem =
-      args.orderBy === "fifo"
-        ? await ctx.db
-            .query("queueItems")
-            .withIndex("by_queue_fifo", (q) => q.eq("queueId", pointer.queueId))
-            .first()
-        : await ctx.db
-            .query("queueItems")
-            .withIndex("by_queue_and_vesting_time", (q) =>
-              q.eq("queueId", pointer.queueId)
-            )
-            .first()
-
     let nextVestingTime: number
+    let nextPriority = DEFAULT_PRIORITY
     let nextLastActiveTime: number
 
-    if (!nextItem) {
-      if (!cachedConfig) {
-        cachedConfig = await resolveConfig(ctx)
+    if (args.orderBy === "vesting") {
+      const nextState = await computeVestingPointerState(ctx.db, {
+        queueId: pointer.queueId,
+        now,
+      })
+
+      if (!nextState.hasItems || !nextState.state) {
+        if (!cachedConfig) {
+          cachedConfig = await resolveConfig(ctx)
+        }
+        // Empty queues should park until the GC window to avoid hot-looping
+        // over pointers that currently have no items.
+        nextVestingTime = now + cachedConfig.minInactiveBeforeDeleteMs
+        nextLastActiveTime = now
+      } else {
+        nextPriority = nextState.state.priority
+        nextVestingTime = nextState.state.vestingTime
+        nextLastActiveTime = now
       }
-      // Empty queues should park until the GC window to avoid hot-looping
-      // over pointers that currently have no items.
-      nextVestingTime = now + cachedConfig.minInactiveBeforeDeleteMs
-      nextLastActiveTime = now
-    } else if (
-      args.orderBy === "fifo" &&
-      nextItem.leaseExpiry !== undefined &&
-      nextItem.leaseExpiry > now
-    ) {
-      // FIFO head is currently leased. Recheck soon so completion can unblock
-      // following items without waiting for full lease expiry.
-      if (!cachedConfig) {
-        cachedConfig = await resolveConfig(ctx)
-      }
-      nextVestingTime = Math.min(
-        nextItem.leaseExpiry,
-        now + cachedConfig.scannerBackoffMinMs
-      )
-      nextLastActiveTime = now
     } else {
-      nextVestingTime = Math.max(now, nextItem.vestingTime)
-      nextLastActiveTime = now
+      const nextItem = await ctx.db
+        .query("queueItems")
+        .withIndex("by_queue_fifo", (q) => q.eq("queueId", pointer.queueId))
+        .first()
+
+      if (!nextItem) {
+        if (!cachedConfig) {
+          cachedConfig = await resolveConfig(ctx)
+        }
+        // Empty queues should park until the GC window to avoid hot-looping
+        // over pointers that currently have no items.
+        nextVestingTime = now + cachedConfig.minInactiveBeforeDeleteMs
+        nextLastActiveTime = now
+      } else if (
+        nextItem.leaseExpiry !== undefined &&
+        nextItem.leaseExpiry > now
+      ) {
+        // FIFO head is currently leased. Recheck soon so completion can unblock
+        // following items without waiting for full lease expiry.
+        if (!cachedConfig) {
+          cachedConfig = await resolveConfig(ctx)
+        }
+        nextVestingTime = Math.min(
+          nextItem.leaseExpiry,
+          now + cachedConfig.scannerBackoffMinMs
+        )
+        nextLastActiveTime = now
+      } else {
+        nextVestingTime = Math.max(now, nextItem.vestingTime)
+        nextLastActiveTime = now
+      }
     }
 
     await ctx.db.patch(args.pointerId, {
       leaseId: undefined,
       leaseExpiry: undefined,
+      priority: nextPriority,
       vestingTime: nextVestingTime,
       lastActiveTime: nextLastActiveTime,
     })
@@ -724,21 +754,17 @@ export const runWorkerAction = internalAction({
   },
 })
 
-async function schedulePointerWakeIfEarlier(
+async function schedulePointerStateUpdateIfBetter(
   ctx: MutationCtx,
   queueId: string,
+  priority: number,
   vestingTime: number
 ) {
-  const pointer = await ctx.db
-    .query("queuePointers")
-    .withIndex("by_queue", (q) => q.eq("queueId", queueId))
-    .unique()
-  if (pointer && vestingTime < pointer.vestingTime) {
-    await ctx.scheduler.runAfter(0, internal.lib.updatePointerVesting, {
-      queueId,
-      vestingTime,
-    })
-  }
+  await ctx.scheduler.runAfter(0, internal.lib.updatePointerState, {
+    queueId,
+    priority,
+    vestingTime,
+  })
 }
 
 export const runWorkerMutation = internalMutation({
@@ -790,7 +816,14 @@ export const runWorkerMutation = internalMutation({
             leaseId: undefined,
             leaseExpiry: undefined,
           })
-          await schedulePointerWakeIfEarlier(ctx, item.queueId, retryVestingTime)
+          if (config.defaultOrderBy === "vesting") {
+            await schedulePointerStateUpdateIfBetter(
+              ctx,
+              item.queueId,
+              item.priority,
+              retryVestingTime
+            )
+          }
           return null
         }
       }
@@ -843,7 +876,14 @@ export const runWorkerMutation = internalMutation({
           leaseId: undefined,
           leaseExpiry: undefined,
         })
-        await schedulePointerWakeIfEarlier(ctx, item.queueId, retryVestingTime)
+        if (config.defaultOrderBy === "vesting") {
+          await schedulePointerStateUpdateIfBetter(
+            ctx,
+            item.queueId,
+            item.priority,
+            retryVestingTime
+          )
+        }
         return null
       }
 

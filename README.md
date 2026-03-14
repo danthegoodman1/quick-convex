@@ -61,6 +61,7 @@ export const enqueueEmail = mutation({
   handler: async (ctx, args) => {
     return await quickVesting.enqueueAction(ctx, {
       queueId: args.userId,
+      priority: 12,
       fn: api.jobs.sendEmailWorker,
       args: { userId: args.userId },
       runAfter: 5_000,
@@ -155,6 +156,14 @@ export const enqueueEmail = mutation({
 - `retry: true` uses class/default retry behavior.
 - `retry: { maxAttempts, initialBackoffMs, base }` sets per-item behavior.
 
+### Priority in vesting mode
+
+- `priority` is optional on `enqueueAction`, `enqueueMutation`, and batch items.
+- Missing `priority` defaults to `0`.
+- Supported values are integers in `0..15`.
+- Higher numbers are higher priority.
+- Priority only affects `"vesting"` mode.
+
 ## Queue behavior
 
 - Supports `"vesting"` and `"fifo"` order modes.
@@ -166,6 +175,8 @@ export const enqueueEmail = mutation({
 ### Choosing an ordering mode
 
 - Use `"vesting"` when throughput is the priority. Ready items can run as soon as they are due, so delayed/retried items do not block newer ready work in the same queue.
+- In `"vesting"` mode, ready items are dequeued by `priority` first, then by `vestingTime` within that priority tier.
+- Cross-queue priority is best-effort rather than strict because queue scheduling is still pointer-based.
 - Use `"fifo"` when strict per-`queueId` ordering is required. This enforces head-of-line semantics for that ordering domain. In `"fifo"` mode, a delayed/retrying head item stalls the rest of that same `queueId` until it is ready again.
 
 In practice, FIFO queues are often a cleaner and more performant alternative to creating many `maxParallelism: 1` workpools (one per ordering domain). With Quick FIFO, use `queueId` as the domain key (for example a user id, account id, or aggregate id), and each domain (`queueId` value) stays ordered while different domains can still process in parallel.

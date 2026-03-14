@@ -54,6 +54,7 @@ function makeComponentApiMock() {
     "mutation",
     {
       queueId: string;
+      priority?: number;
       payload: any;
       handler: string;
       handlerType?: "action" | "mutation";
@@ -85,6 +86,7 @@ function makeComponentApiMock() {
     {
       items: Array<{
         queueId: string;
+        priority?: number;
         payload: any;
         handler: string;
         handlerType?: "action" | "mutation";
@@ -145,6 +147,7 @@ describe("Quick client", () => {
 
     const result = await quick.enqueueAction(ctx, {
       queueId: "queue-a",
+      priority: 4,
       fn: actionWorkerRef,
       args: { value: 1 },
       runAfter: 25,
@@ -156,6 +159,7 @@ describe("Quick client", () => {
     expect(ctx.runMutation).toHaveBeenCalledTimes(1);
     expect(ctx.runMutation).toHaveBeenCalledWith(component.lib.enqueue, {
       queueId: "queue-a",
+      priority: 4,
       payload: { value: 1 },
       handler: "action-handle",
       handlerType: "action",
@@ -174,6 +178,7 @@ describe("Quick client", () => {
 
     const result = await quick.enqueueMutation(ctx, {
       queueId: "queue-b",
+      priority: 7,
       fn: mutationWorkerRef,
       args: { value: 2 },
     });
@@ -184,6 +189,7 @@ describe("Quick client", () => {
     expect(ctx.runMutation).toHaveBeenCalledTimes(1);
     expect(ctx.runMutation).toHaveBeenCalledWith(component.lib.enqueue, {
       queueId: "queue-b",
+      priority: 7,
       payload: { value: 2 },
       handler: "mutation-handle",
       handlerType: "mutation",
@@ -225,6 +231,7 @@ describe("Quick client", () => {
     expect(handleMock).toHaveBeenNthCalledWith(2, onCompleteRef);
     expect(ctx.runMutation).toHaveBeenCalledWith(component.lib.enqueue, {
       queueId: "queue-on-complete",
+      priority: undefined,
       payload: { value: 9 },
       handler: "action-handle",
       handlerType: "action",
@@ -267,6 +274,7 @@ describe("Quick client", () => {
       items: [
         {
           queueId: "queue-c",
+          priority: undefined,
           payload: { value: 1 },
           handler: "handle:index.test:workerAction",
           handlerType: "action",
@@ -279,6 +287,7 @@ describe("Quick client", () => {
         },
         {
           queueId: "queue-c",
+          priority: undefined,
           payload: { value: 2 },
           handler: "handle:index.test:workerAction",
           handlerType: "action",
@@ -291,6 +300,7 @@ describe("Quick client", () => {
         },
         {
           queueId: "queue-c",
+          priority: undefined,
           payload: { value: 3 },
           handler: "handle:index.test:workerActionTwo",
           handlerType: "action",
@@ -342,6 +352,7 @@ describe("Quick client", () => {
       items: [
         {
           queueId: "queue-c",
+          priority: undefined,
           payload: { value: 1 },
           handler: "handle:index.test:workerAction",
           handlerType: "action",
@@ -354,6 +365,7 @@ describe("Quick client", () => {
         },
         {
           queueId: "queue-c",
+          priority: undefined,
           payload: { value: 2 },
           handler: "handle:index.test:workerAction",
           handlerType: "action",
@@ -366,6 +378,7 @@ describe("Quick client", () => {
         },
         {
           queueId: "queue-c",
+          priority: undefined,
           payload: { value: 3 },
           handler: "handle:index.test:workerActionTwo",
           handlerType: "action",
@@ -413,6 +426,7 @@ describe("Quick client", () => {
 
     expect(ctx.runMutation).toHaveBeenNthCalledWith(1, component.lib.enqueue, {
       queueId: "queue-config",
+      priority: undefined,
       payload: { value: 99 },
       handler: "handle:index.test:workerAction",
       handlerType: "action",
@@ -441,6 +455,7 @@ describe("Quick client", () => {
         items: [
           {
             queueId: "queue-config",
+            priority: undefined,
             payload: { value: 100 },
             handler: "handle:index.test:workerAction",
             handlerType: "action",
@@ -464,5 +479,53 @@ describe("Quick client", () => {
         },
       },
     );
+  });
+
+  test("enqueueBatchAction forwards item priorities", async () => {
+    const ctx = makeCtxMock();
+    const component = makeComponentApiMock();
+    const quick = new Quick(component);
+    const handleMock = vi.mocked(createFunctionHandle);
+    handleMock.mockImplementation(
+      async (fn: FunctionReference<any, any, any>) =>
+        `handle:${getFunctionName(fn)}` as any,
+    );
+    ctx.runMutation.mockResolvedValueOnce(["id-1", "id-2"]);
+
+    await quick.enqueueBatchAction(ctx, [
+      { queueId: "queue-priority", priority: 15, fn: actionWorkerRef, args: { value: 1 } },
+      { queueId: "queue-priority", priority: 3, fn: actionWorkerTwoRef, args: { value: 2 } },
+    ]);
+
+    expect(ctx.runMutation).toHaveBeenCalledWith(component.lib.enqueueBatch, {
+      items: [
+        {
+          queueId: "queue-priority",
+          priority: 15,
+          payload: { value: 1 },
+          handler: "handle:index.test:workerAction",
+          handlerType: "action",
+          runAfter: undefined,
+          runAt: undefined,
+          retry: undefined,
+          retryBehavior: undefined,
+          onCompleteHandler: undefined,
+          onCompleteContext: undefined,
+        },
+        {
+          queueId: "queue-priority",
+          priority: 3,
+          payload: { value: 2 },
+          handler: "handle:index.test:workerActionTwo",
+          handlerType: "action",
+          runAfter: undefined,
+          runAt: undefined,
+          retry: undefined,
+          retryBehavior: undefined,
+          onCompleteHandler: undefined,
+          onCompleteContext: undefined,
+        },
+      ],
+    });
   });
 });
