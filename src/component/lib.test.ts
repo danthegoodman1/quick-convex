@@ -32,6 +32,7 @@ const completionStatusValidator = v.union(
   v.literal("cancelled"),
 );
 const onCompleteAttemptsByWorkId = new Map<string, number>();
+const executionsByQueueId = new Map<string, "action" | "mutation">();
 
 const markProbeExecutedRef = makeFunctionReference<
   "mutation",
@@ -40,6 +41,26 @@ const markProbeExecutedRef = makeFunctionReference<
     via: "action" | "mutation";
   }
 >("lib.test:markProbeExecuted");
+
+export const markQueueExecuted = mutation({
+  args: {
+    queueId: v.string(),
+    via: v.union(v.literal("action"), v.literal("mutation")),
+  },
+  returns: v.null(),
+  handler: async (_ctx, args) => {
+    executionsByQueueId.set(args.queueId, args.via);
+    return null;
+  },
+});
+
+const markQueueExecutedRef = makeFunctionReference<
+  "mutation",
+  {
+    queueId: string;
+    via: "action" | "mutation";
+  }
+>("lib.test:markQueueExecuted");
 
 export const recordOnComplete = mutation({
   args: {
@@ -131,6 +152,21 @@ export const workerMutationExec = mutation({
   },
 });
 
+export const workerMutationExecNoProbe = mutation({
+  args: {
+    payload: v.any(),
+    queueId: v.string(),
+  },
+  returns: v.null(),
+  handler: async (ctx, args) => {
+    await ctx.runMutation(markQueueExecutedRef, {
+      queueId: args.queueId,
+      via: "mutation",
+    });
+    return null;
+  },
+});
+
 export const workerAlwaysFailAction = action({
   args: {
     payload: v.any(),
@@ -151,6 +187,11 @@ const workerMutationExecRef = makeFunctionReference<
   "mutation",
   { payload: { probeId: string }; queueId: string }
 >("lib.test:workerMutationExec");
+
+const workerMutationExecNoProbeRef = makeFunctionReference<
+  "mutation",
+  { payload: unknown; queueId: string }
+>("lib.test:workerMutationExecNoProbe");
 
 const workerAlwaysFailActionRef = makeFunctionReference<
   "action",
@@ -192,6 +233,7 @@ export const createWorkerHandle = mutation({
     type: v.union(
       v.literal("actionExec"),
       v.literal("mutationExec"),
+      v.literal("mutationExecNoProbe"),
       v.literal("alwaysFailAction"),
       v.literal("recordOnComplete"),
       v.literal("onCompleteTimeoutTwice"),
@@ -205,6 +247,9 @@ export const createWorkerHandle = mutation({
     }
     if (args.type === "mutationExec") {
       return await createFunctionHandle(workerMutationExecRef);
+    }
+    if (args.type === "mutationExecNoProbe") {
+      return await createFunctionHandle(workerMutationExecNoProbeRef);
     }
     if (args.type === "recordOnComplete") {
       return await createFunctionHandle(recordOnCompleteRef);
@@ -231,6 +276,7 @@ describe("component runtime execution", () => {
   beforeEach(() => {
     vi.useFakeTimers();
     onCompleteAttemptsByWorkId.clear();
+    executionsByQueueId.clear();
   });
 
   afterEach(() => {
@@ -1135,6 +1181,44 @@ describe("component runtime execution", () => {
     expect(pointer?.leaseExpiry).toBeUndefined();
     expect(slot?.leaseId).toBeUndefined();
     expect(slot?.leaseExpiry).toBeUndefined();
+  });
+
+  test("scanner does not leave a follow-up wake scheduled after draining the only ready queue", async () => {
+    const t = initConvexTest();
+    const queueId = "queue-single-dispatch";
+
+    const handle = await t.mutation(testApi.createWorkerHandle, {
+      type: "mutationExecNoProbe",
+    });
+
+    await t.mutation(api.lib.enqueue, {
+      queueId,
+      payload: { ignored: true },
+      handler: handle,
+      handlerType: "mutation",
+    });
+
+    // Drive the immediate wake -> scan -> manager chain, but intentionally do
+    // not advance the scanner backoff timer. If Quick rescheduled the scanner
+    // unnecessarily, `scheduledFunctionId` will still be set here.
+    for (let i = 0; i < 3; i++) {
+      vi.advanceTimersByTime(0);
+      await t.finishInProgressScheduledFunctions();
+    }
+
+    const [items, scannerState] = await t.run(async (ctx) =>
+      Promise.all([
+        ctx.db
+          .query("queueItems")
+          .withIndex("by_queue_priority_and_vesting_time", (q) => q.eq("queueId", queueId))
+          .collect(),
+        ctx.db.query("scannerState").first(),
+      ]),
+    );
+
+    expect(executionsByQueueId.get(queueId)).toBe("mutation");
+    expect(items).toHaveLength(0);
+    expect(scannerState?.scheduledFunctionId).toBeUndefined();
   });
 
   test("runManager finalizes pointer when manager slot claim fails", async () => {

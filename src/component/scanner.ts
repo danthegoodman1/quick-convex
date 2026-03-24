@@ -64,6 +64,33 @@ async function wakeScanner(
   return true
 }
 
+async function clearScannerScheduleIfComponentIdle(ctx: MutationCtx) {
+  const state = await ctx.db.query("scannerState").first()
+  if (!state) {
+    return
+  }
+
+  const remainingItem = await ctx.db.query("queueItems").first()
+  if (remainingItem) {
+    return
+  }
+
+  if (state.scheduledFunctionId) {
+    const scheduledFunctionId = state.scheduledFunctionId as Id<"_scheduled_functions">
+    const scheduledJob = await ctx.db.system.get("_scheduled_functions", scheduledFunctionId)
+    if (scheduledJob?.state.kind === "pending") {
+      await ctx.scheduler.cancel(scheduledFunctionId)
+    }
+  }
+
+  await ctx.db.patch(state._id, {
+    leaseId: undefined,
+    leaseExpiry: undefined,
+    scheduledFunctionId: undefined,
+    lastRunAt: Date.now(),
+  })
+}
+
 export const tryWakeScanner = internalMutation({
   args: {},
   returns: v.boolean(),
@@ -646,6 +673,11 @@ export const finalizePointer = internalMutation({
 
     if (nextVestingTime <= now) {
       await ctx.scheduler.runAfter(0, internal.scanner.tryWakeScanner, {})
+    } else {
+      // Once the last queue item drains, there is no useful work left for the
+      // scanner to poll. Clear any follow-up wake so convex-test doesn't keep
+      // a stale scheduled function alive past test completion.
+      await clearScannerScheduleIfComponentIdle(ctx)
     }
 
     return null
