@@ -16,6 +16,36 @@ app.use(quickConvex, { name: "quickFifo" });
 export default app;
 ```
 
+## Testing with convex-test
+
+Register each Quick component instance with `convex-test` using the helper from
+`@danthegoodman/quick-convex/test`. Use the same component names you configured
+in `convex.config.ts`.
+
+```ts
+import { convexTest } from "convex-test";
+import schema from "./schema.js";
+import quickTest from "@danthegoodman/quick-convex/test";
+
+const modules = import.meta.glob("./**/*.*s");
+
+export function initConvexTest() {
+  const t = convexTest(schema, modules);
+
+  quickTest.register(t, "quickVesting");
+  quickTest.register(t, "quickFifo");
+
+  return t;
+}
+```
+
+Once a queue has drained and the component is idle, Quick should settle cleanly
+under `convex-test` without any extra Quick-specific teardown step.
+
+If your test intentionally leaves delayed work scheduled for the future, that
+scheduled work will still exist at test end. The teardown fix only covers stale
+internal Quick reschedules after the component is otherwise idle.
+
 ## Quick Class API
 
 Use the class API for enqueueing work:
