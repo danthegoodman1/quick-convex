@@ -218,7 +218,7 @@ export const claimScannerLease = internalQuery({
     nextPointerVestingTime: v.union(v.null(), v.number()),
     availableSlotCount: v.number(),
   }),
-  handler: async (ctx, _args) => {
+  handler: async (ctx, args) => {
     const config = await resolveConfig(ctx)
     const now = Date.now()
 
