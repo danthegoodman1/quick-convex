@@ -9,6 +9,7 @@ import {
   type MutationCtx,
 } from "./_generated/server.js"
 import { internal } from "./_generated/api.js"
+import type { Id } from "./_generated/dataModel.js"
 import schema from "./schema.js"
 
 export type QueueOrder = "vesting" | "fifo"
@@ -222,12 +223,151 @@ function getPointerCandidateForItem(
   }
 }
 
+async function hasActiveLeasedItemsForQueue(
+  db: QueryCtx["db"],
+  queueId: string,
+  now: number
+): Promise<boolean> {
+  for await (const item of db
+    .query("queueItems")
+    .withIndex("by_queue_fifo", (q) => q.eq("queueId", queueId))) {
+    if (item.leaseExpiry && item.leaseExpiry > now) {
+      return true
+    }
+  }
+
+  return false
+}
+
+async function findActiveManagerSlotsForPointer(
+  ctx: MutationCtx,
+  args: {
+    pointerId: Id<"queuePointers">
+    queueId: string
+    now: number
+  }
+) {
+  const config = await resolveConfig(ctx)
+  const activeSlots: Array<{
+    _id: Id<"managerSlots">
+    slotNumber: number
+    leaseId?: string
+    leaseExpiry?: number
+  }> = []
+
+  for await (const slot of ctx.db
+    .query("managerSlots")
+    .withIndex("by_slot_number", (q) =>
+      q.gte("slotNumber", 0).lt("slotNumber", config.managerSlots)
+    )) {
+    if (
+      slot.pointerId === args.pointerId &&
+      slot.queueId === args.queueId &&
+      slot.leaseExpiry !== undefined &&
+      slot.leaseExpiry > args.now
+    ) {
+      activeSlots.push({
+        _id: slot._id,
+        slotNumber: slot.slotNumber,
+        leaseId: slot.leaseId,
+        leaseExpiry: slot.leaseExpiry,
+      })
+    }
+  }
+
+  return activeSlots
+}
+
+async function recoverStalePointerLeaseIfNeeded(
+  ctx: MutationCtx,
+  args: {
+    pointer: typeof queuePointerValidator.type
+    candidate: PointerState
+    now: number
+    wakeReason: "enqueue" | "pointerReady"
+  }
+): Promise<boolean> {
+  if (!args.pointer.leaseExpiry || args.pointer.leaseExpiry <= args.now) {
+    return false
+  }
+
+  const config = await resolveConfig(ctx)
+  const leaseAgeMs = Math.max(0, args.now - args.pointer.lastActiveTime)
+
+  const hasActiveLeasedItems = await hasActiveLeasedItemsForQueue(
+    ctx.db,
+    args.pointer.queueId,
+    args.now
+  )
+  if (hasActiveLeasedItems) {
+    if (args.wakeReason === "enqueue") {
+      console.info("[quick] enqueue skipped pointer promotion because queue still has leased work", {
+        queueId: args.pointer.queueId,
+        pointerId: args.pointer._id,
+        pointerLeaseExpiry: args.pointer.leaseExpiry,
+      })
+    }
+    return false
+  }
+
+  if (leaseAgeMs < config.scannerBackoffMaxMs) {
+    if (args.wakeReason === "enqueue") {
+      console.info("[quick] enqueue skipped pointer promotion because pointer lease is still within recovery grace", {
+        queueId: args.pointer.queueId,
+        pointerId: args.pointer._id,
+        pointerLeaseExpiry: args.pointer.leaseExpiry,
+        leaseAgeMs,
+        recoveryGraceMs: config.scannerBackoffMaxMs,
+      })
+    }
+    return false
+  }
+
+  const activeSlots = await findActiveManagerSlotsForPointer(ctx, {
+    pointerId: args.pointer._id,
+    queueId: args.pointer.queueId,
+    now: args.now,
+  })
+
+  console.warn("[quick] recovering stale leased pointer", {
+    queueId: args.pointer.queueId,
+    pointerId: args.pointer._id,
+    pointerLeaseExpiry: args.pointer.leaseExpiry,
+    leaseAgeMs,
+    activeManagerSlots: activeSlots.map((slot) => slot.slotNumber),
+  })
+
+  for (const slot of activeSlots) {
+    await ctx.db.patch(slot._id, {
+      leaseId: undefined,
+      leaseExpiry: undefined,
+      pointerId: undefined,
+      queueId: undefined,
+    })
+  }
+
+  await ctx.db.patch(args.pointer._id, {
+    leaseId: undefined,
+    leaseExpiry: undefined,
+    priority: args.candidate.priority,
+    vestingTime: args.candidate.vestingTime,
+    lastActiveTime: args.now,
+  })
+
+  await ctx.scheduler.runAfter(0, internal.scanner.tryWakeScanner, {
+    reason: args.wakeReason,
+  })
+
+  return true
+}
+
 async function upsertPointerStateIfBetter(
   ctx: MutationCtx,
   args: {
     queueId: string
     candidate: PointerState
     now: number
+    wakeReason: "enqueue" | "pointerReady"
   }
 ) {
   const pointer = await ctx.db
@@ -242,24 +382,37 @@ async function upsertPointerStateIfBetter(
       vestingTime: args.candidate.vestingTime,
       lastActiveTime: args.now,
     })
-    await ctx.scheduler.runAfter(0, internal.scanner.tryWakeScanner, {})
+    await ctx.scheduler.runAfter(0, internal.scanner.tryWakeScanner, {
+      reason: args.wakeReason,
+    })
     return
   }
+
+  const candidateShouldPromote = shouldPromotePointerState(
+    {
+      priority: pointer.priority,
+      vestingTime: pointer.vestingTime,
+    },
+    args.candidate,
+    args.now
+  )
 
   if (pointer.leaseExpiry && pointer.leaseExpiry > args.now) {
+    if (
+      candidateShouldPromote &&
+      (await recoverStalePointerLeaseIfNeeded(ctx, {
+        pointer,
+        candidate: args.candidate,
+        now: args.now,
+        wakeReason: args.wakeReason,
+      }))
+    ) {
+      return
+    }
     return
   }
 
-  if (
-    !shouldPromotePointerState(
-      {
-        priority: pointer.priority,
-        vestingTime: pointer.vestingTime,
-      },
-      args.candidate,
-      args.now
-    )
-  ) {
+  if (!candidateShouldPromote) {
     return
   }
 
@@ -268,7 +421,9 @@ async function upsertPointerStateIfBetter(
     vestingTime: args.candidate.vestingTime,
     lastActiveTime: args.now,
   })
-  await ctx.scheduler.runAfter(0, internal.scanner.tryWakeScanner, {})
+  await ctx.scheduler.runAfter(0, internal.scanner.tryWakeScanner, {
+    reason: args.wakeReason,
+  })
 }
 
 async function ensureQueuePointer(
@@ -294,7 +449,9 @@ async function ensureQueuePointer(
     vestingTime: args.vestingTime,
     lastActiveTime: args.now,
   })
-  await ctx.scheduler.runAfter(0, internal.scanner.tryWakeScanner, {})
+  await ctx.scheduler.runAfter(0, internal.scanner.tryWakeScanner, {
+    reason: "enqueue",
+  })
 }
 
 export async function computeVestingPointerState(
@@ -470,6 +627,7 @@ export const updatePointerState = internalMutation({
         vestingTime: args.vestingTime,
       },
       now: Date.now(),
+      wakeReason: "pointerReady",
     })
     return null
   },
@@ -524,6 +682,7 @@ export const enqueue = mutation({
         queueId: args.queueId,
         candidate: getPointerCandidateForItem({ priority, vestingTime }, now),
         now,
+        wakeReason: "enqueue",
       })
     } else {
       await ensureQueuePointer(ctx, {
@@ -612,6 +771,7 @@ export const enqueueBatch = mutation({
           queueId,
           candidate,
           now,
+          wakeReason: "enqueue",
         })
       }
     } else {
@@ -895,6 +1055,7 @@ async function updatePointerStateIfBetter(
     queueId,
     candidate,
     now: Date.now(),
+    wakeReason: "pointerReady",
   })
 }
 

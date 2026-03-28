@@ -4,6 +4,7 @@ import type { FunctionHandle } from "convex/server"
 import {
   internalAction,
   internalMutation,
+  internalQuery,
   type MutationCtx,
 } from "./_generated/server.js"
 import { internal } from "./_generated/api.js"
@@ -18,6 +19,95 @@ import {
 
 const POINTER_OVERSCAN_MULTIPLIER = 5
 const MANAGER_SLOT_LEASE_MS = 600_000
+const OCC_RETRY_MAX_ATTEMPTS = 5
+const OCC_RETRY_BASE_DELAY_MS = 25
+const OCC_RETRY_MAX_DELAY_MS = 250
+
+function isOptimisticConcurrencyError(error: unknown): boolean {
+  const messages: string[] = []
+
+  if (typeof error === "string") {
+    messages.push(error)
+  }
+
+  if (error && typeof error === "object") {
+    const candidate = error as {
+      message?: unknown
+      cause?: unknown
+      data?: unknown
+    }
+
+    if (typeof candidate.message === "string") {
+      messages.push(candidate.message)
+    }
+    if (typeof candidate.cause === "string") {
+      messages.push(candidate.cause)
+    }
+    if (candidate.data && typeof candidate.data === "object") {
+      const data = candidate.data as { message?: unknown }
+      if (typeof data.message === "string") {
+        messages.push(data.message)
+      }
+    } else if (typeof candidate.data === "string") {
+      messages.push(candidate.data)
+    }
+  }
+
+  messages.push(String(error))
+  return messages.some((message) =>
+    /documents read from or written to|changed while this mutation was being run|optimistic concurrency|error#1/i.test(
+      message
+    )
+  )
+}
+
+const sleep = (ms: number) =>
+  new Promise<void>((resolve) => {
+    setTimeout(resolve, ms)
+  })
+
+async function runMutationWithOccRetry<T>(
+  run: () => Promise<T>,
+  opts: {
+    operation: string
+    context?: Record<string, unknown>
+    returnNullOnExhausted?: boolean
+  }
+): Promise<T | null> {
+  for (let attempt = 1; attempt <= OCC_RETRY_MAX_ATTEMPTS; attempt++) {
+    try {
+      return await run()
+    } catch (error) {
+      if (!isOptimisticConcurrencyError(error)) {
+        throw error
+      }
+
+      if (attempt === OCC_RETRY_MAX_ATTEMPTS) {
+        if (opts.returnNullOnExhausted) {
+          console.error("[quick] mutation hit repeated OCC conflicts; letting another action pass win", {
+            operation: opts.operation,
+            attempts: attempt,
+            ...opts.context,
+          }, error)
+          return null
+        }
+        throw error
+      }
+
+      console.warn("[quick] retrying mutation after OCC conflict", {
+        operation: opts.operation,
+        attempt,
+        maxAttempts: OCC_RETRY_MAX_ATTEMPTS,
+        ...opts.context,
+      })
+      await sleep(
+        Math.min(OCC_RETRY_MAX_DELAY_MS, OCC_RETRY_BASE_DELAY_MS * attempt)
+      )
+    }
+  }
+
+  return null
+}
 
 async function wakeScanner(
   ctx: MutationCtx,
@@ -26,11 +116,15 @@ async function wakeScanner(
      * Whether to check for work before waking the scanner, used during recovery
      */
     checkForWork?: boolean
+    reason?: "enqueue" | "pointerReady"
   } = {}
 ): Promise<boolean> {
   const config = await resolveConfig(ctx)
   const now = Date.now()
   const state = await ctx.db.query("scannerState").first()
+  const wasParked =
+    state !== null &&
+    (state.leaseExpiry === undefined || state.leaseExpiry <= now)
 
   if (state && state.leaseExpiry && state.leaseExpiry > now) {
     return false
@@ -49,6 +143,14 @@ async function wakeScanner(
   const leaseId = uuid()
   const leaseExpiry = now + config.scannerLeaseDurationMs
 
+  if (state?.scheduledFunctionId) {
+    const scheduledFunctionId = state.scheduledFunctionId as Id<"_scheduled_functions">
+    const scheduledJob = await ctx.db.system.get("_scheduled_functions", scheduledFunctionId)
+    if (scheduledJob?.state.kind === "pending") {
+      await ctx.scheduler.cancel(scheduledFunctionId)
+    }
+  }
+
   const stateId = state
     ? (await ctx.db.patch(state._id, { leaseId, leaseExpiry, lastRunAt: now }), state._id)
     : await ctx.db.insert("scannerState", { leaseId, leaseExpiry, lastRunAt: now })
@@ -60,6 +162,10 @@ async function wakeScanner(
   )
 
   await ctx.db.patch(stateId, { scheduledFunctionId: scheduledId })
+
+  if (opts.reason === "enqueue" && wasParked) {
+    console.info("[quick] enqueue woke parked scanner")
+  }
 
   return true
 }
@@ -92,12 +198,95 @@ async function clearScannerScheduleIfComponentIdle(ctx: MutationCtx) {
 }
 
 export const tryWakeScanner = internalMutation({
-  args: {},
+  args: {
+    reason: v.optional(v.union(v.literal("enqueue"), v.literal("pointerReady"))),
+  },
   returns: v.boolean(),
-  handler: async (ctx) => wakeScanner(ctx), // We don't want to wake the scanner because this is only called after work is enqueued
+  handler: async (ctx, args) => wakeScanner(ctx, { reason: args.reason }),
 })
 
-export const claimScannerLease = internalMutation({
+export const claimScannerLease = internalQuery({
+  args: {
+    leaseId: v.string(),
+  },
+  returns: v.object({
+    valid: v.boolean(),
+    orderBy: v.union(v.literal("vesting"), v.literal("fifo")),
+    workersPerManager: v.number(),
+    hasDuePointers: v.boolean(),
+    nextPointerLeased: v.boolean(),
+    nextPointerVestingTime: v.union(v.null(), v.number()),
+    availableSlotCount: v.number(),
+  }),
+  handler: async (ctx, args) => {
+    const config = await resolveConfig(ctx)
+    const now = Date.now()
+
+    const state = await ctx.db.query("scannerState").first()
+
+    if (!state || state.leaseId !== args.leaseId) {
+      return {
+        valid: false,
+        orderBy: config.defaultOrderBy,
+        workersPerManager: config.workersPerManager,
+        hasDuePointers: false,
+        nextPointerLeased: false,
+        nextPointerVestingTime: null,
+        availableSlotCount: 0,
+      }
+    }
+
+    if (state.leaseExpiry && state.leaseExpiry < now) {
+      return {
+        valid: false,
+        orderBy: config.defaultOrderBy,
+        workersPerManager: config.workersPerManager,
+        hasDuePointers: false,
+        nextPointerLeased: false,
+        nextPointerVestingTime: null,
+        availableSlotCount: 0,
+      }
+    }
+
+    const duePointersQuery = () =>
+      ctx.db.query("queuePointers").withIndex("by_vesting", (q) => q.lte("vestingTime", now))
+    const hasDuePointers = (await duePointersQuery().first()) !== null
+
+    const nextPointer = await ctx.db
+      .query("queuePointers")
+      .withIndex("by_vesting")
+      .first()
+
+    let existingSlots = 0
+    let availableSlotCount = 0
+
+    for await (const slot of ctx.db
+      .query("managerSlots")
+      .withIndex("by_slot_number", (q) =>
+        q.gte("slotNumber", 0).lt("slotNumber", config.managerSlots)
+      )) {
+      existingSlots++
+      if (!slot.leaseExpiry || slot.leaseExpiry <= now) {
+        availableSlotCount++
+      }
+    }
+
+    availableSlotCount += Math.max(0, config.managerSlots - existingSlots)
+
+    return {
+      valid: true,
+      orderBy: config.defaultOrderBy,
+      workersPerManager: config.workersPerManager,
+      hasDuePointers,
+      nextPointerLeased:
+        nextPointer?.leaseExpiry !== undefined && nextPointer.leaseExpiry > now,
+      nextPointerVestingTime: nextPointer?.vestingTime ?? null,
+      availableSlotCount,
+    }
+  },
+})
+
+export const claimAvailablePointers = internalMutation({
   args: {
     leaseId: v.string(),
   },
@@ -120,46 +309,8 @@ export const claimScannerLease = internalMutation({
   handler: async (ctx, args) => {
     const config = await resolveConfig(ctx)
     const now = Date.now()
-
-    const state = await ctx.db.query("scannerState").first()
-
-    if (!state || state.leaseId !== args.leaseId) {
-      return {
-        valid: false,
-        orderBy: config.defaultOrderBy,
-        workersPerManager: config.workersPerManager,
-        hasDuePointers: false,
-        nextPointerLeased: false,
-        nextPointerVestingTime: null,
-        pointers: [],
-      }
-    }
-
-    if (state.leaseExpiry && state.leaseExpiry < now) {
-      return {
-        valid: false,
-        orderBy: config.defaultOrderBy,
-        workersPerManager: config.workersPerManager,
-        hasDuePointers: false,
-        nextPointerLeased: false,
-        nextPointerVestingTime: null,
-        pointers: [],
-      }
-    }
-
-    await ctx.db.patch(state._id, {
-      leaseExpiry: now + config.scannerLeaseDurationMs,
-      lastRunAt: now,
-    })
-
     const duePointersQuery = () =>
       ctx.db.query("queuePointers").withIndex("by_vesting", (q) => q.lte("vestingTime", now))
-    const hasDuePointers = (await duePointersQuery().first()) !== null
-
-    const nextPointer = await ctx.db
-      .query("queuePointers")
-      .withIndex("by_vesting")
-      .first()
 
     const managerSlotsByNumber = new Map<
       number,
@@ -267,6 +418,15 @@ export const claimScannerLease = internalMutation({
         leaseId: pointerLeaseId,
         leaseExpiry: pointerLeaseExpiry,
         vestingTime: pointerLeaseExpiry,
+        lastActiveTime: now,
+      })
+
+      console.info("[quick] scanner claimed pointer", {
+        queueId: pointer.queueId,
+        pointerId: pointer._id,
+        pointerLeaseId,
+        pointerLeaseExpiry,
+        slotNumber,
       })
 
       claimedPointers.push({
@@ -281,10 +441,9 @@ export const claimScannerLease = internalMutation({
       valid: true,
       orderBy: config.defaultOrderBy,
       workersPerManager: config.workersPerManager,
-      hasDuePointers,
-      nextPointerLeased:
-        nextPointer?.leaseExpiry !== undefined && nextPointer.leaseExpiry > now,
-      nextPointerVestingTime: nextPointer?.vestingTime ?? null,
+      hasDuePointers: false,
+      nextPointerLeased: false,
+      nextPointerVestingTime: null,
       pointers: claimedPointers,
     }
   },
@@ -295,25 +454,76 @@ export const runScanner = internalAction({
     leaseId: v.string(),
   },
   handler: async (ctx, args) => {
-    const result = await ctx.runMutation(internal.scanner.claimScannerLease, {
+    const inspection = await ctx.runQuery(internal.scanner.claimScannerLease, {
       leaseId: args.leaseId,
     })
 
-    if (!result.valid) {
+    if (!inspection.valid) {
       return
     }
 
-    if (result.pointers.length === 0) {
-      if (result.hasDuePointers) {
-        await ctx.runMutation(internal.scanner.rescheduleScanner, {
+    if (!inspection.hasDuePointers) {
+      await runMutationWithOccRetry(
+        () =>
+          ctx.runMutation(internal.scanner.parkScanner, {
+            leaseId: args.leaseId,
+            nextPointerVestingTime: inspection.nextPointerVestingTime ?? undefined,
+          }),
+        {
+          operation: "parkScanner",
+          context: {
+            leaseId: args.leaseId,
+            nextPointerVestingTime: inspection.nextPointerVestingTime ?? undefined,
+          },
+        }
+      )
+      return
+    }
+
+    if (inspection.availableSlotCount <= 0) {
+      await runMutationWithOccRetry(
+        () =>
+          ctx.runMutation(internal.scanner.rescheduleScanner, {
+            leaseId: args.leaseId,
+            hasWork: false,
+          }),
+        {
+          operation: "rescheduleScanner",
+          context: { leaseId: args.leaseId, hasWork: false },
+        }
+      )
+      return
+    }
+
+    const result = await runMutationWithOccRetry(
+      () =>
+        ctx.runMutation(internal.scanner.claimAvailablePointers, {
           leaseId: args.leaseId,
-          hasWork: false,
-        })
-      } else {
-        await ctx.runMutation(internal.scanner.parkScanner, {
-          leaseId: args.leaseId,
-          nextPointerVestingTime: result.nextPointerVestingTime ?? undefined,
-        })
+        }),
+      {
+        operation: "claimAvailablePointers",
+        context: { leaseId: args.leaseId },
+        returnNullOnExhausted: true,
+      }
+    )
+
+    if (!result) {
+      return
+    }
+
+    if (!result.valid || result.pointers.length === 0) {
+      if (inspection.hasDuePointers) {
+        await runMutationWithOccRetry(
+          () =>
+            ctx.runMutation(internal.scanner.rescheduleScanner, {
+              leaseId: args.leaseId,
+              hasWork: false,
+            }),
+          {
+            operation: "rescheduleScanner",
+            context: { leaseId: args.leaseId, hasWork: false },
+          }
+        )
       }
       return
     }
@@ -324,17 +534,24 @@ export const runScanner = internalAction({
           pointerId: pointer.pointerId,
           queueId: pointer.queueId,
           pointerLeaseId: pointer.pointerLeaseId,
-          orderBy: result.orderBy,
-          workersPerManager: result.workersPerManager,
+          orderBy: inspection.orderBy,
+          workersPerManager: inspection.workersPerManager,
           slotNumber: pointer.slotNumber,
         })
       )
     )
 
-    await ctx.runMutation(internal.scanner.rescheduleScanner, {
-      leaseId: args.leaseId,
-      hasWork: true,
-    })
+    await runMutationWithOccRetry(
+      () =>
+        ctx.runMutation(internal.scanner.rescheduleScanner, {
+          leaseId: args.leaseId,
+          hasWork: true,
+        }),
+      {
+        operation: "rescheduleScanner",
+        context: { leaseId: args.leaseId, hasWork: true },
+      }
+    )
   },
 })
 
@@ -359,6 +576,7 @@ export const parkScanner = internalMutation({
         scheduledFunctionId: undefined,
         lastRunAt: now,
       })
+      console.info("[quick] scanner fully parked")
       return null
     }
 
@@ -483,6 +701,14 @@ export const tryClaimManagerSlot = internalMutation({
       queueId: args.queueId,
     })
 
+    console.info("[quick] manager slot claimed", {
+      queueId: args.queueId,
+      pointerId: args.pointerId,
+      pointerLeaseId: args.pointerLeaseId,
+      slotNumber: args.slotNumber,
+      slotLeaseId,
+    })
+
     return { claimed: true, slotLeaseId }
   },
 })
@@ -521,38 +747,106 @@ export const runManager = internalAction({
     slotNumber: v.number(),
   },
   handler: async (ctx, args) => {
-    const slotClaim = await ctx.runMutation(internal.scanner.tryClaimManagerSlot, {
-      slotNumber: args.slotNumber,
+    console.info("[quick] runManager started", {
+      queueId: args.queueId,
       pointerId: args.pointerId,
       pointerLeaseId: args.pointerLeaseId,
-      queueId: args.queueId,
+      slotNumber: args.slotNumber,
     })
 
+    const slotClaim = await runMutationWithOccRetry(
+      () =>
+        ctx.runMutation(internal.scanner.tryClaimManagerSlot, {
+          slotNumber: args.slotNumber,
+          pointerId: args.pointerId,
+          pointerLeaseId: args.pointerLeaseId,
+          queueId: args.queueId,
+        }),
+      {
+        operation: "tryClaimManagerSlot",
+        context: {
+          queueId: args.queueId,
+          pointerId: args.pointerId,
+          pointerLeaseId: args.pointerLeaseId,
+          slotNumber: args.slotNumber,
+        },
+      }
+    )
+
+    if (!slotClaim) {
+      return
+    }
+
     if (!slotClaim.claimed || !slotClaim.slotLeaseId) {
-      await ctx.runMutation(internal.scanner.finalizePointer, {
-        pointerId: args.pointerId,
-        pointerLeaseId: args.pointerLeaseId,
-        isEmpty: false,
-        orderBy: args.orderBy,
-      })
+      await runMutationWithOccRetry(
+        () =>
+          ctx.runMutation(internal.scanner.finalizePointer, {
+            pointerId: args.pointerId,
+            pointerLeaseId: args.pointerLeaseId,
+            isEmpty: false,
+            orderBy: args.orderBy,
+          }),
+        {
+          operation: "finalizePointer",
+          context: {
+            queueId: args.queueId,
+            pointerId: args.pointerId,
+            pointerLeaseId: args.pointerLeaseId,
+            slotNumber: args.slotNumber,
+            slotLeaseId: slotClaim.slotLeaseId,
+          },
+        }
+      )
       return
     }
 
     let pointerFinalized = false
+    let runError: unknown = null
     try {
-      const items = await ctx.runMutation(internal.lib.dequeue, {
-        queueId: args.queueId,
-        limit: args.workersPerManager,
-        orderBy: args.orderBy,
-      })
+      const items = await runMutationWithOccRetry(
+        () =>
+          ctx.runMutation(internal.lib.dequeue, {
+            queueId: args.queueId,
+            limit: args.workersPerManager,
+            orderBy: args.orderBy,
+          }),
+        {
+          operation: "dequeue",
+          context: {
+            queueId: args.queueId,
+            pointerId: args.pointerId,
+            pointerLeaseId: args.pointerLeaseId,
+            slotNumber: args.slotNumber,
+            slotLeaseId: slotClaim.slotLeaseId,
+          },
+        }
+      )
+
+      if (!items) {
+        return
+      }
 
       if (items.length === 0) {
-        await ctx.runMutation(internal.scanner.finalizePointer, {
-          pointerId: args.pointerId,
-          pointerLeaseId: args.pointerLeaseId,
-          isEmpty: true,
-          orderBy: args.orderBy,
-        })
+        await runMutationWithOccRetry(
+          () =>
+            ctx.runMutation(internal.scanner.finalizePointer, {
+              pointerId: args.pointerId,
+              pointerLeaseId: args.pointerLeaseId,
+              isEmpty: true,
+              orderBy: args.orderBy,
+            }),
+          {
+            operation: "finalizePointer",
+            context: {
+              queueId: args.queueId,
+              pointerId: args.pointerId,
+              pointerLeaseId: args.pointerLeaseId,
+              slotNumber: args.slotNumber,
+              slotLeaseId: slotClaim.slotLeaseId,
+              isEmpty: true,
+            },
+          }
+        )
         pointerFinalized = true
         return
       }
@@ -578,26 +872,129 @@ export const runManager = internalAction({
         )
       )
 
-      await ctx.runMutation(internal.scanner.finalizePointer, {
+      await runMutationWithOccRetry(
+        () =>
+          ctx.runMutation(internal.scanner.finalizePointer, {
+            pointerId: args.pointerId,
+            pointerLeaseId: args.pointerLeaseId,
+            isEmpty: false,
+            orderBy: args.orderBy,
+          }),
+        {
+          operation: "finalizePointer",
+          context: {
+            queueId: args.queueId,
+            pointerId: args.pointerId,
+            pointerLeaseId: args.pointerLeaseId,
+            slotNumber: args.slotNumber,
+            slotLeaseId: slotClaim.slotLeaseId,
+            isEmpty: false,
+          },
+        }
+      )
+      pointerFinalized = true
+    } catch (error) {
+      runError = error
+      console.error("[quick] runManager failed before cleanup", {
+        queueId: args.queueId,
         pointerId: args.pointerId,
         pointerLeaseId: args.pointerLeaseId,
-        isEmpty: false,
-        orderBy: args.orderBy,
-      })
-      pointerFinalized = true
-    } finally {
-      if (!pointerFinalized) {
-        await ctx.runMutation(internal.scanner.finalizePointer, {
-          pointerId: args.pointerId,
-          pointerLeaseId: args.pointerLeaseId,
-          isEmpty: false,
-          orderBy: args.orderBy,
-        })
-      }
-      await ctx.runMutation(internal.scanner.releaseManagerSlot, {
         slotNumber: args.slotNumber,
         slotLeaseId: slotClaim.slotLeaseId,
-      })
+      }, error)
+    } finally {
+      let cleanupError: unknown = null
+
+      if (!pointerFinalized) {
+        try {
+          await runMutationWithOccRetry(
+            () =>
+              ctx.runMutation(internal.scanner.finalizePointer, {
+                pointerId: args.pointerId,
+                pointerLeaseId: args.pointerLeaseId,
+                isEmpty: false,
+                orderBy: args.orderBy,
+              }),
+            {
+              operation: "finalizePointer",
+              context: {
+                queueId: args.queueId,
+                pointerId: args.pointerId,
+                pointerLeaseId: args.pointerLeaseId,
+                slotNumber: args.slotNumber,
+                slotLeaseId: slotClaim.slotLeaseId,
+                isEmpty: false,
+                phase: "cleanup",
+              },
+            }
+          )
+          pointerFinalized = true
+        } catch (error) {
+          cleanupError = error
+          console.error("[quick] finalizePointer failed during runManager cleanup", {
+            queueId: args.queueId,
+            pointerId: args.pointerId,
+            pointerLeaseId: args.pointerLeaseId,
+            slotNumber: args.slotNumber,
+            slotLeaseId: slotClaim.slotLeaseId,
+          }, error)
+        }
+      }
+
+      try {
+        const released = await runMutationWithOccRetry(
+          () =>
+            ctx.runMutation(internal.scanner.releaseManagerSlot, {
+              slotNumber: args.slotNumber,
+              slotLeaseId: slotClaim.slotLeaseId,
+            }),
+          {
+            operation: "releaseManagerSlot",
+            context: {
+              queueId: args.queueId,
+              pointerId: args.pointerId,
+              pointerLeaseId: args.pointerLeaseId,
+              slotNumber: args.slotNumber,
+              slotLeaseId: slotClaim.slotLeaseId,
+            },
+          }
+        )
+        if (!released) {
+          console.error("[quick] releaseManagerSlot returned false during runManager cleanup", {
+            queueId: args.queueId,
+            pointerId: args.pointerId,
+            pointerLeaseId: args.pointerLeaseId,
+            slotNumber: args.slotNumber,
+            slotLeaseId: slotClaim.slotLeaseId,
+          })
+        }
+      } catch (error) {
+        cleanupError ??= error
+        console.error("[quick] releaseManagerSlot threw during runManager cleanup", {
+          queueId: args.queueId,
+          pointerId: args.pointerId,
+          pointerLeaseId: args.pointerLeaseId,
+          slotNumber: args.slotNumber,
+          slotLeaseId: slotClaim.slotLeaseId,
+        }, error)
+      }
+
+      if (pointerFinalized) {
+        console.info("[quick] runManager cleaned up", {
+          queueId: args.queueId,
+          pointerId: args.pointerId,
+          pointerLeaseId: args.pointerLeaseId,
+          slotNumber: args.slotNumber,
+          slotLeaseId: slotClaim.slotLeaseId,
+        })
+      }
+
+      if (cleanupError) {
+        throw cleanupError
+      }
+      if (runError) {
+        throw runError
+      }
     }
   },
 })
@@ -689,7 +1086,9 @@ export const finalizePointer = internalMutation({
     })
 
     if (nextVestingTime <= now) {
-      await ctx.scheduler.runAfter(0, internal.scanner.tryWakeScanner, {})
+      await ctx.scheduler.runAfter(0, internal.scanner.tryWakeScanner, {
+        reason: "pointerReady",
+      })
     } else {
       // Once the last queue item drains, there is no useful work left for the
       // scanner to poll. Clear any follow-up wake so convex-test doesn't keep

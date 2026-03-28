@@ -948,7 +948,7 @@ describe("component runtime execution", () => {
     ).rejects.toThrow("priority must be an integer between 0 and 15");
   });
 
-  test("claimScannerLease is bounded by available manager slots", async () => {
+  test("claimAvailablePointers is bounded by available manager slots", async () => {
     const t = initConvexTest();
     const now = Date.now();
     const scannerLeaseId = "scanner-lease";
@@ -984,7 +984,7 @@ describe("component runtime execution", () => {
       });
     });
 
-    const result = await t.mutation(internal.scanner.claimScannerLease, {
+    const result = await t.mutation(internal.scanner.claimAvailablePointers, {
       leaseId: scannerLeaseId,
     });
 
@@ -999,7 +999,7 @@ describe("component runtime execution", () => {
     expect(slots.map((slot) => slot.slotNumber)).toEqual([0, 1]);
   });
 
-  test("claimScannerLease prefers higher-priority due pointers in vesting mode", async () => {
+  test("claimAvailablePointers prefers higher-priority due pointers in vesting mode", async () => {
     const t = initConvexTest();
     const now = Date.now();
     const scannerLeaseId = "scanner-priority-lease";
@@ -1030,13 +1030,52 @@ describe("component runtime execution", () => {
       });
     });
 
-    const result = await t.mutation(internal.scanner.claimScannerLease, {
+    const result = await t.mutation(internal.scanner.claimAvailablePointers, {
       leaseId: scannerLeaseId,
     });
 
     expect(result.valid).toBe(true);
     expect(result.pointers).toHaveLength(1);
     expect(result.pointers[0].queueId).toBe("queue-high-priority");
+  });
+
+  test("claimScannerLease inspection is read-only on scannerState", async () => {
+    const t = initConvexTest();
+    const now = Date.now();
+    const scannerLeaseId = "scanner-inspect-lease";
+
+    await t.run(async (ctx) => {
+      await ctx.db.insert("config", {
+        managerSlots: 2,
+        workersPerManager: 1,
+      });
+      await ctx.db.insert("queuePointers", {
+        queueId: "queue-inspect",
+        priority: 0,
+        vestingTime: now - 1_000,
+        lastActiveTime: now,
+      });
+      await ctx.db.insert("scannerState", {
+        leaseId: scannerLeaseId,
+        leaseExpiry: now + 5_000,
+        lastRunAt: now,
+      });
+    });
+
+    const inspection = await t.query(internal.scanner.claimScannerLease, {
+      leaseId: scannerLeaseId,
+    });
+
+    const scannerState = await t.run(async (ctx) =>
+      ctx.db.query("scannerState").first(),
+    );
+
+    expect(inspection.valid).toBe(true);
+    expect(inspection.hasDuePointers).toBe(true);
+    expect(inspection.availableSlotCount).toBe(2);
+    expect(scannerState?.leaseId).toBe(scannerLeaseId);
+    expect(scannerState?.leaseExpiry).toBe(now + 5_000);
+    expect(scannerState?.lastRunAt).toBe(now);
   });
 
   test("tryClaimManagerSlot claims and releases slot ownership", async () => {
@@ -1219,6 +1258,232 @@ describe("component runtime execution", () => {
     expect(executionsByQueueId.get(queueId)).toBe("mutation");
     expect(items).toHaveLength(0);
     expect(scannerState?.scheduledFunctionId).toBeUndefined();
+  });
+
+  test("enqueue recovers stale leased pointer and manager slot so ready work runs promptly", async () => {
+    const t = initConvexTest();
+    const now = Date.now();
+    const queueId = "queue-stale-leased-pointer";
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    try {
+      const handle = await t.mutation(testApi.createWorkerHandle, {
+        type: "mutationExecNoProbe",
+      });
+
+      const { pointerId, slotNumber } = await t.run(async (ctx) => {
+        await ctx.db.insert("config", {
+          defaultOrderBy: "vesting",
+          managerSlots: 4,
+          workersPerManager: 1,
+          scannerBackoffMaxMs: 5_000,
+        });
+        const pointerId = await ctx.db.insert("queuePointers", {
+          queueId,
+          priority: 1,
+          vestingTime: now + 600_000,
+          leaseId: "stale-pointer-lease",
+          leaseExpiry: now + 600_000,
+          lastActiveTime: now - 6_000,
+        });
+        await ctx.db.insert("managerSlots", {
+          slotNumber: 1,
+          leaseId: "stale-manager-slot",
+          leaseExpiry: now + 600_000,
+          pointerId,
+          queueId,
+        });
+        return { pointerId, slotNumber: 1 };
+      });
+
+      await t.mutation(api.lib.enqueue, {
+        queueId,
+        priority: 1,
+        payload: { ignored: true },
+        handler: handle,
+        handlerType: "mutation",
+      });
+
+      for (let i = 0; i < 4; i++) {
+        vi.advanceTimersByTime(0);
+        await t.finishInProgressScheduledFunctions();
+      }
+
+      const [items, pointer, slot] = await t.run(async (ctx) =>
+        Promise.all([
+          ctx.db
+            .query("queueItems")
+            .withIndex("by_queue_priority_and_vesting_time", (q) => q.eq("queueId", queueId))
+            .collect(),
+          ctx.db.get(pointerId),
+          ctx.db
+            .query("managerSlots")
+            .withIndex("by_slot_number", (q) => q.eq("slotNumber", slotNumber))
+            .unique(),
+        ]),
+      );
+
+      expect(executionsByQueueId.get(queueId)).toBe("mutation");
+      expect(items).toHaveLength(0);
+      expect(pointer?.leaseId).toBeUndefined();
+      expect(pointer?.leaseExpiry).toBeUndefined();
+      expect(slot?.leaseId).toBeUndefined();
+      expect(slot?.leaseExpiry).toBeUndefined();
+      expect(warnSpy).toHaveBeenCalledWith(
+        "[quick] recovering stale leased pointer",
+        expect.objectContaining({
+          queueId,
+          activeManagerSlots: [slotNumber],
+        }),
+      );
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  test("enqueue does not recover a healthy leased pointer while work is still in flight", async () => {
+    const t = initConvexTest();
+    const now = Date.now();
+    const queueId = "queue-healthy-leased-pointer";
+    const infoSpy = vi.spyOn(console, "info").mockImplementation(() => {});
+
+    try {
+      const pointerId = await t.run(async (ctx) => {
+        await ctx.db.insert("config", {
+          defaultOrderBy: "vesting",
+          managerSlots: 4,
+          workersPerManager: 1,
+          scannerBackoffMaxMs: 5_000,
+        });
+        const pointerId = await ctx.db.insert("queuePointers", {
+          queueId,
+          priority: 1,
+          vestingTime: now + 600_000,
+          leaseId: "healthy-pointer-lease",
+          leaseExpiry: now + 600_000,
+          lastActiveTime: now,
+        });
+        await ctx.db.insert("managerSlots", {
+          slotNumber: 2,
+          leaseId: "healthy-manager-slot",
+          leaseExpiry: now + 600_000,
+          pointerId,
+          queueId,
+        });
+        await ctx.db.insert("queueItems", {
+          queueId,
+          priority: 1,
+          payload: { inFlight: true },
+          handler: "noop",
+          handlerType: "action",
+          vestingTime: now + 30_000,
+          leaseId: "healthy-item-lease",
+          leaseExpiry: now + 30_000,
+          errorCount: 0,
+        });
+        return pointerId;
+      });
+
+      await t.mutation(api.lib.enqueue, {
+        queueId,
+        priority: 1,
+        payload: { ignored: true },
+        handler: "noop",
+        handlerType: "action",
+      });
+
+      const [pointer, slot] = await t.run(async (ctx) =>
+        Promise.all([
+          ctx.db.get(pointerId),
+          ctx.db
+            .query("managerSlots")
+            .withIndex("by_slot_number", (q) => q.eq("slotNumber", 2))
+            .unique(),
+        ]),
+      );
+
+      expect(pointer?.leaseId).toBe("healthy-pointer-lease");
+      expect(pointer?.leaseExpiry).toBe(now + 600_000);
+      expect(slot?.leaseId).toBe("healthy-manager-slot");
+      expect(slot?.leaseExpiry).toBe(now + 600_000);
+      expect(infoSpy).toHaveBeenCalledWith(
+        "[quick] enqueue skipped pointer promotion because queue still has leased work",
+        expect.objectContaining({ queueId }),
+      );
+    } finally {
+      infoSpy.mockRestore();
+    }
+  });
+
+  test("parkScanner logs when the scanner becomes fully parked", async () => {
+    const t = initConvexTest();
+    const now = Date.now();
+    const infoSpy = vi.spyOn(console, "info").mockImplementation(() => {});
+
+    try {
+      await t.run(async (ctx) => {
+        await ctx.db.insert("scannerState", {
+          leaseId: "scanner-lease-fully-parked",
+          leaseExpiry: now + 30_000,
+          lastRunAt: now,
+        });
+      });
+
+      await t.mutation(internal.scanner.parkScanner, {
+        leaseId: "scanner-lease-fully-parked",
+      });
+
+      const scannerState = await t.run(async (ctx) =>
+        ctx.db.query("scannerState").first(),
+      );
+      expect(scannerState?.leaseId).toBeUndefined();
+      expect(scannerState?.leaseExpiry).toBeUndefined();
+      expect(scannerState?.scheduledFunctionId).toBeUndefined();
+      expect(infoSpy).toHaveBeenCalledWith("[quick] scanner fully parked");
+    } finally {
+      infoSpy.mockRestore();
+    }
+  });
+
+  test("enqueue wake logs when it wakes a parked scanner and cancels the stale parked wake", async () => {
+    const t = initConvexTest();
+    const now = Date.now();
+    const infoSpy = vi.spyOn(console, "info").mockImplementation(() => {});
+
+    try {
+      const parkedWakeId = await t.run(async (ctx) => {
+        const scheduledFunctionId = await ctx.scheduler.runAfter(
+          60_000,
+          internal.scanner.watchdogRecoverScanner,
+          {},
+        );
+        await ctx.db.insert("scannerState", {
+          scheduledFunctionId,
+          lastRunAt: now,
+        });
+        return scheduledFunctionId;
+      });
+
+      const woke = await t.mutation(internal.scanner.tryWakeScanner, {
+        reason: "enqueue",
+      });
+
+      const [scannerState, parkedWake] = await t.run(async (ctx) =>
+        Promise.all([
+          ctx.db.query("scannerState").first(),
+          ctx.db.system.get("_scheduled_functions", parkedWakeId),
+        ]),
+      );
+
+      expect(woke).toBe(true);
+      expect(scannerState?.leaseId).toBeDefined();
+      expect(scannerState?.scheduledFunctionId).toBeDefined();
+      expect(scannerState?.scheduledFunctionId).not.toBe(parkedWakeId);
+      expect(parkedWake?.state.kind).toBe("canceled");
+      expect(infoSpy).toHaveBeenCalledWith("[quick] enqueue woke parked scanner");
+    } finally {
+      infoSpy.mockRestore();
+    }
   });
 
   test("runScanner parks a leased future pointer without holding the scanner lease", async () => {
