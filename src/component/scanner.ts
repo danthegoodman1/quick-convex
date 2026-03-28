@@ -304,10 +304,10 @@ export const runScanner = internalAction({
     }
 
     if (result.pointers.length === 0) {
-      if (result.hasDuePointers || result.nextPointerLeased) {
+      if (result.hasDuePointers) {
         await ctx.runMutation(internal.scanner.rescheduleScanner, {
           leaseId: args.leaseId,
-          hasWork: true,
+          hasWork: false,
         })
       } else {
         await ctx.runMutation(internal.scanner.parkScanner, {
@@ -396,20 +396,37 @@ export const rescheduleScanner = internalMutation({
       return null
     }
 
-    const newLeaseId = uuid()
-    const delayMs = args.hasWork ? config.scannerBackoffMinMs : config.scannerBackoffMaxMs
+    let scheduledId: Id<"_scheduled_functions">
 
-    await ctx.db.patch(state._id, {
-      leaseId: newLeaseId,
-      leaseExpiry: now + config.scannerLeaseDurationMs,
-      lastRunAt: now,
-    })
+    if (args.hasWork) {
+      const newLeaseId = uuid()
 
-    const scheduledId = await ctx.scheduler.runAfter(
-      delayMs,
-      internal.scanner.runScanner,
-      { leaseId: newLeaseId }
-    )
+      await ctx.db.patch(state._id, {
+        leaseId: newLeaseId,
+        leaseExpiry: now + config.scannerLeaseDurationMs,
+        lastRunAt: now,
+      })
+
+      scheduledId = await ctx.scheduler.runAfter(
+        config.scannerBackoffMinMs,
+        internal.scanner.runScanner,
+        { leaseId: newLeaseId }
+      )
+    } else {
+      await ctx.db.patch(state._id, {
+        leaseId: undefined,
+        leaseExpiry: undefined,
+        lastRunAt: now,
+      })
+
+      // Slow-path retries should not hold the scanner lease so a newly enqueued
+      // item can wake the scanner immediately instead of waiting for backoff.
+      scheduledId = await ctx.scheduler.runAfter(
+        config.scannerBackoffMaxMs,
+        internal.scanner.watchdogRecoverScanner,
+        {}
+      )
+    }
 
     await ctx.db.patch(state._id, {
       scheduledFunctionId: scheduledId,

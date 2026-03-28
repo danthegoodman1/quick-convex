@@ -1221,6 +1221,86 @@ describe("component runtime execution", () => {
     expect(scannerState?.scheduledFunctionId).toBeUndefined();
   });
 
+  test("runScanner parks a leased future pointer without holding the scanner lease", async () => {
+    const t = initConvexTest();
+    const now = Date.now();
+    const scannerLeaseId = "scanner-lease-future-pointer";
+    const futureVestingTime = now + 20_000;
+
+    await t.run(async (ctx) => {
+      await ctx.db.insert("scannerState", {
+        leaseId: scannerLeaseId,
+        leaseExpiry: now + 30_000,
+        lastRunAt: now,
+      });
+      await ctx.db.insert("queuePointers", {
+        queueId: "queue-future-pointer",
+        priority: 0,
+        vestingTime: futureVestingTime,
+        leaseId: "pointer-lease",
+        leaseExpiry: futureVestingTime,
+        lastActiveTime: now,
+      });
+    });
+
+    await t.action(internal.scanner.runScanner, {
+      leaseId: scannerLeaseId,
+    });
+
+    const scannerState = await t.run(async (ctx) =>
+      ctx.db.query("scannerState").first(),
+    );
+    expect(scannerState?.leaseId).toBeUndefined();
+    expect(scannerState?.leaseExpiry).toBeUndefined();
+    expect(scannerState?.scheduledFunctionId).toBeDefined();
+
+    const woke = await t.mutation(internal.scanner.tryWakeScanner, {});
+    expect(woke).toBe(true);
+  });
+
+  test("runScanner slow-backs off without holding the scanner lease when all slots are busy", async () => {
+    const t = initConvexTest();
+    const now = Date.now();
+    const scannerLeaseId = "scanner-lease-busy-slots";
+
+    await t.run(async (ctx) => {
+      await ctx.db.insert("config", {
+        managerSlots: 1,
+        scannerBackoffMaxMs: 12_345,
+      });
+      await ctx.db.insert("scannerState", {
+        leaseId: scannerLeaseId,
+        leaseExpiry: now + 30_000,
+        lastRunAt: now,
+      });
+      await ctx.db.insert("managerSlots", {
+        slotNumber: 0,
+        leaseId: "busy-slot",
+        leaseExpiry: now + 60_000,
+      });
+      await ctx.db.insert("queuePointers", {
+        queueId: "queue-due-busy-slot",
+        priority: 0,
+        vestingTime: now - 1_000,
+        lastActiveTime: now,
+      });
+    });
+
+    await t.action(internal.scanner.runScanner, {
+      leaseId: scannerLeaseId,
+    });
+
+    const scannerState = await t.run(async (ctx) =>
+      ctx.db.query("scannerState").first(),
+    );
+    expect(scannerState?.leaseId).toBeUndefined();
+    expect(scannerState?.leaseExpiry).toBeUndefined();
+    expect(scannerState?.scheduledFunctionId).toBeDefined();
+
+    const woke = await t.mutation(internal.scanner.tryWakeScanner, {});
+    expect(woke).toBe(true);
+  });
+
   test("runManager finalizes pointer when manager slot claim fails", async () => {
     const t = initConvexTest();
     const now = Date.now();
