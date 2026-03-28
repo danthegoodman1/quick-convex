@@ -218,7 +218,7 @@ export const claimScannerLease = internalQuery({
     nextPointerVestingTime: v.union(v.null(), v.number()),
     availableSlotCount: v.number(),
   }),
-  handler: async (ctx, args) => {
+  handler: async (ctx, _args) => {
     const config = await resolveConfig(ctx)
     const now = Date.now()
 
@@ -306,7 +306,7 @@ export const claimAvailablePointers = internalMutation({
       })
     ),
   }),
-  handler: async (ctx, args) => {
+  handler: async (ctx, _args) => {
     const config = await resolveConfig(ctx)
     const now = Date.now()
     const duePointersQuery = () =>
@@ -988,13 +988,11 @@ export const runManager = internalAction({
           slotLeaseId: slotClaim.slotLeaseId,
         })
       }
+      runError = cleanupError ?? runError
+    }
 
-      if (cleanupError) {
-        throw cleanupError
-      }
-      if (runError) {
-        throw runError
-      }
+    if (runError) {
+      throw runError
     }
   },
 })
