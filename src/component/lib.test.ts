@@ -167,6 +167,21 @@ export const workerMutationExecNoProbe = mutation({
   },
 });
 
+export const workerActionExecNoProbe = action({
+  args: {
+    payload: v.any(),
+    queueId: v.string(),
+  },
+  returns: v.null(),
+  handler: async (ctx, args) => {
+    await ctx.runMutation(markQueueExecutedRef, {
+      queueId: args.queueId,
+      via: "action",
+    });
+    return null;
+  },
+});
+
 export const workerAlwaysFailAction = action({
   args: {
     payload: v.any(),
@@ -192,6 +207,11 @@ const workerMutationExecNoProbeRef = makeFunctionReference<
   "mutation",
   { payload: unknown; queueId: string }
 >("lib.test:workerMutationExecNoProbe");
+
+const workerActionExecNoProbeRef = makeFunctionReference<
+  "action",
+  { payload: unknown; queueId: string }
+>("lib.test:workerActionExecNoProbe");
 
 const workerAlwaysFailActionRef = makeFunctionReference<
   "action",
@@ -232,6 +252,7 @@ export const createWorkerHandle = mutation({
   args: {
     type: v.union(
       v.literal("actionExec"),
+      v.literal("actionExecNoProbe"),
       v.literal("mutationExec"),
       v.literal("mutationExecNoProbe"),
       v.literal("alwaysFailAction"),
@@ -244,6 +265,9 @@ export const createWorkerHandle = mutation({
   handler: async (_ctx, args) => {
     if (args.type === "actionExec") {
       return await createFunctionHandle(workerActionExecRef);
+    }
+    if (args.type === "actionExecNoProbe") {
+      return await createFunctionHandle(workerActionExecNoProbeRef);
     }
     if (args.type === "mutationExec") {
       return await createFunctionHandle(workerMutationExecRef);
@@ -1256,6 +1280,43 @@ describe("component runtime execution", () => {
     );
 
     expect(executionsByQueueId.get(queueId)).toBe("mutation");
+    expect(items).toHaveLength(0);
+    expect(scannerState?.scheduledFunctionId).toBeUndefined();
+  });
+
+  test("scheduled scanner drain runs action-backed queue workers", async () => {
+    const t = initConvexTest();
+    const queueId = "queue-action-scheduled-drain";
+
+    const handle = await t.mutation(testApi.createWorkerHandle, {
+      type: "actionExecNoProbe",
+    });
+
+    await t.mutation(api.lib.enqueue, {
+      queueId,
+      payload: { ignored: true },
+      handler: handle,
+      handlerType: "action",
+    });
+
+    // Exercise the user-facing queue path: enqueue wakes the scanner, the
+    // scanner schedules a manager, and the manager runs the action worker.
+    for (let i = 0; i < 4; i++) {
+      vi.advanceTimersByTime(0);
+      await t.finishInProgressScheduledFunctions();
+    }
+
+    const [items, scannerState] = await t.run(async (ctx) =>
+      Promise.all([
+        ctx.db
+          .query("queueItems")
+          .withIndex("by_queue_priority_and_vesting_time", (q) => q.eq("queueId", queueId))
+          .collect(),
+        ctx.db.query("scannerState").first(),
+      ]),
+    );
+
+    expect(executionsByQueueId.get(queueId)).toBe("action");
     expect(items).toHaveLength(0);
     expect(scannerState?.scheduledFunctionId).toBeUndefined();
   });
