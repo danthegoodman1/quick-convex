@@ -1,5 +1,11 @@
 import { v } from "convex/values"
 import { v7 as uuid } from "uuid"
+import { makeFunctionReference } from "convex/server"
+import type {
+  FunctionReference,
+  FunctionReturnType,
+  OptionalRestArgs,
+} from "convex/server"
 import {
   internalMutation,
   internalQuery,
@@ -29,6 +35,17 @@ export const PRIORITY_LEVELS_DESC = Array.from(
   (_, index) => MAX_PRIORITY - index
 )
 
+type SnapshotMutationCtx = MutationCtx & {
+  runSnapshotQuery<Query extends FunctionReference<"query", "public" | "internal">>(
+    query: Query,
+    ...args: OptionalRestArgs<Query>
+  ): Promise<FunctionReturnType<Query>>
+}
+
+function withSnapshotQueries(ctx: MutationCtx): SnapshotMutationCtx {
+  return ctx as SnapshotMutationCtx
+}
+
 export const retryBehaviorValidator = v.object({
   maxAttempts: v.number(),
   initialBackoffMs: v.number(),
@@ -46,6 +63,19 @@ const queueItemValidator = schema.tables.queueItems.validator.extend({
   _id: v.id("queueItems"),
   _creationTime: v.number(),
 })
+
+type QueueItem = typeof queueItemValidator.type
+
+const getAvailableItemsSnapshotRef = makeFunctionReference<
+  "query",
+  {
+    queueId: string
+    limit: number
+    orderBy: QueueOrder
+    now: number
+  },
+  QueueItem[]
+>("lib:getAvailableItemsSnapshot")
 
 const queuePointerValidator = schema.tables.queuePointers.validator.extend({
   _id: v.id("queuePointers"),
@@ -909,6 +939,23 @@ async function collectAvailableItems(
   return availableItems
 }
 
+export const getAvailableItemsSnapshot = internalQuery({
+  args: {
+    queueId: v.string(),
+    limit: v.number(),
+    orderBy: v.union(v.literal("vesting"), v.literal("fifo")),
+    now: v.number(),
+  },
+  returns: v.array(queueItemValidator),
+  handler: async (ctx, args) =>
+    await collectAvailableItems(ctx.db, {
+      queueId: args.queueId,
+      limit: args.limit,
+      orderBy: args.orderBy,
+      now: args.now,
+    }),
+})
+
 export const peekItems = internalQuery({
   args: {
     queueId: v.string(),
@@ -1014,19 +1061,62 @@ export const dequeue = internalMutation({
     const leaseDurationMs = args.leaseDurationMs ?? config.defaultLeaseDurationMs
     const orderBy = (args.orderBy ?? config.defaultOrderBy) as QueueOrder
 
-    const availableItems = await collectAvailableItems(ctx.db, {
-      queueId: args.queueId,
-      limit,
-      orderBy,
-      now,
-    })
+    let availableItems = await withSnapshotQueries(ctx).runSnapshotQuery(
+      getAvailableItemsSnapshotRef,
+      {
+        queueId: args.queueId,
+        limit,
+        orderBy,
+        now,
+      }
+    )
+
+    if (availableItems.length === 0) {
+      availableItems = await collectAvailableItems(ctx.db, {
+        queueId: args.queueId,
+        limit,
+        orderBy,
+        now,
+      })
+    }
+
+    const selectedItems: Array<typeof queueItemValidator.type> = []
+    for (const snapshotItem of availableItems.slice(0, limit)) {
+      const item = await ctx.db.get(snapshotItem._id)
+      if (!item) {
+        continue
+      }
+
+      if (!isItemReadyAt(item as typeof queueItemValidator.type, now)) {
+        if (orderBy === "fifo") {
+          break
+        }
+        continue
+      }
+
+      selectedItems.push(item as typeof queueItemValidator.type)
+
+      if (selectedItems.length >= limit) {
+        break
+      }
+    }
+
+    if (selectedItems.length === 0 && availableItems.length > 0) {
+      const confirmedItems = await collectAvailableItems(ctx.db, {
+        queueId: args.queueId,
+        limit,
+        orderBy,
+        now,
+      })
+      selectedItems.push(...confirmedItems.slice(0, limit))
+    }
 
     const result: Array<{
       item: typeof queueItemValidator.type
       leaseId: string
     }> = []
 
-    for (const item of availableItems.slice(0, limit)) {
+    for (const item of selectedItems.slice(0, limit)) {
       const leaseId = uuid()
       const leaseExpiry = now + leaseDurationMs
 

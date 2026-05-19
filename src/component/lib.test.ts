@@ -248,6 +248,27 @@ const onCompleteAlwaysFailsRef = makeFunctionReference<
   }
 >("lib.test:onCompleteAlwaysFails");
 
+const dequeueRef = makeFunctionReference<
+  "mutation",
+  {
+    queueId: string;
+    limit?: number;
+    orderBy?: "vesting" | "fifo";
+  },
+  Array<{ leaseId: string }>
+>("lib:dequeue");
+
+const finalizePointerRef = makeFunctionReference<
+  "mutation",
+  {
+    pointerId: string;
+    pointerLeaseId: string;
+    isEmpty: boolean;
+    orderBy: "vesting" | "fifo";
+  },
+  null
+>("scanner:finalizePointer");
+
 export const createWorkerHandle = mutation({
   args: {
     type: v.union(
@@ -288,10 +309,67 @@ export const createWorkerHandle = mutation({
   },
 });
 
+export const insertThenDequeue = mutation({
+  args: {
+    queueId: v.string(),
+  },
+  returns: v.number(),
+  handler: async (ctx, args) => {
+    await ctx.db.insert("queueItems", {
+      queueId: args.queueId,
+      priority: 0,
+      payload: { insertedInCaller: true },
+      handler: "noop",
+      handlerType: "action",
+      vestingTime: Date.now() - 1_000,
+      errorCount: 0,
+    });
+
+    const leased = await ctx.runMutation(dequeueRef, {
+      queueId: args.queueId,
+      limit: 1,
+      orderBy: "vesting",
+    });
+
+    return leased.length;
+  },
+});
+
+export const insertThenFinalizePointer = mutation({
+  args: {
+    pointerId: v.id("queuePointers"),
+    pointerLeaseId: v.string(),
+    queueId: v.string(),
+  },
+  returns: v.null(),
+  handler: async (ctx, args) => {
+    await ctx.db.insert("queueItems", {
+      queueId: args.queueId,
+      priority: 15,
+      payload: { insertedInCaller: true },
+      handler: "noop",
+      handlerType: "action",
+      vestingTime: Date.now() - 1_000,
+      errorCount: 0,
+    });
+
+    await ctx.runMutation(finalizePointerRef, {
+      pointerId: args.pointerId,
+      pointerLeaseId: args.pointerLeaseId,
+      isEmpty: false,
+      orderBy: "vesting",
+    });
+
+    return null;
+  },
+});
+
 const testApi = (
   anyApi as unknown as ApiFromModules<{
     "lib.test": {
       createWorkerHandle: typeof createWorkerHandle;
+      insertThenDequeue: typeof insertThenDequeue;
+      insertThenFinalizePointer: typeof insertThenFinalizePointer;
     };
   }>
 )["lib.test"];
@@ -972,6 +1050,29 @@ describe("component runtime execution", () => {
     ).rejects.toThrow("priority must be an integer between 0 and 15");
   });
 
+  test("dequeue confirms when snapshot misses a caller transaction write", async () => {
+    const t = initConvexTest();
+    const queueId = "queue-snapshot-confirm-dequeue";
+
+    const leasedCount = await t.mutation(testApi.insertThenDequeue, {
+      queueId,
+    });
+
+    const items = await t.run(async (ctx) =>
+      ctx.db
+        .query("queueItems")
+        .withIndex("by_queue_priority_and_vesting_time", (q) => q.eq("queueId", queueId))
+        .collect(),
+    );
+
+    // Snapshot queries intentionally don't observe the caller mutation's pending
+    // insert, so dequeue must do a dependency-bearing confirmation before
+    // returning empty.
+    expect(leasedCount).toBe(1);
+    expect(items).toHaveLength(1);
+    expect(items[0].leaseId).toBeDefined();
+  });
+
   test("claimAvailablePointers is bounded by available manager slots", async () => {
     const t = initConvexTest();
     const now = Date.now();
@@ -1269,19 +1370,25 @@ describe("component runtime execution", () => {
       await t.finishInProgressScheduledFunctions();
     }
 
-    const [items, scannerState] = await t.run(async (ctx) =>
+    const [items, scannerState, slot] = await t.run(async (ctx) =>
       Promise.all([
         ctx.db
           .query("queueItems")
           .withIndex("by_queue_priority_and_vesting_time", (q) => q.eq("queueId", queueId))
           .collect(),
         ctx.db.query("scannerState").first(),
+        ctx.db
+          .query("managerSlots")
+          .withIndex("by_slot_number", (q) => q.eq("slotNumber", 0))
+          .unique(),
       ]),
     );
 
     expect(executionsByQueueId.get(queueId)).toBe("mutation");
     expect(items).toHaveLength(0);
     expect(scannerState?.scheduledFunctionId).toBeUndefined();
+    expect(slot?.leaseId).toBeUndefined();
+    expect(slot?.leaseExpiry).toBeUndefined();
   });
 
   test("scheduled scanner drain runs action-backed queue workers", async () => {
@@ -1569,7 +1676,7 @@ describe("component runtime execution", () => {
       });
     });
 
-    await t.action(internal.scanner.runScanner, {
+    await t.mutation(internal.scanner.runScanner, {
       leaseId: scannerLeaseId,
     });
 
@@ -1612,7 +1719,7 @@ describe("component runtime execution", () => {
       });
     });
 
-    await t.action(internal.scanner.runScanner, {
+    await t.mutation(internal.scanner.runScanner, {
       leaseId: scannerLeaseId,
     });
 
@@ -1625,6 +1732,54 @@ describe("component runtime execution", () => {
 
     const woke = await t.mutation(internal.scanner.tryWakeScanner, {});
     expect(woke).toBe(true);
+  });
+
+  test("runScanner claims pointer and manager slot in the same mutation", async () => {
+    const t = initConvexTest();
+    const now = Date.now();
+    const scannerLeaseId = "scanner-lease-transactional-claim";
+
+    const pointerId = await t.run(async (ctx) => {
+      await ctx.db.insert("config", {
+        managerSlots: 1,
+        workersPerManager: 1,
+      });
+      await ctx.db.insert("scannerState", {
+        leaseId: scannerLeaseId,
+        leaseExpiry: now + 30_000,
+        lastRunAt: now,
+      });
+      return await ctx.db.insert("queuePointers", {
+        queueId: "queue-transactional-scanner",
+        priority: 0,
+        vestingTime: now - 1_000,
+        lastActiveTime: now,
+      });
+    });
+
+    await t.mutation(internal.scanner.runScanner, {
+      leaseId: scannerLeaseId,
+    });
+
+    const [pointer, slot, scannerState] = await t.run(async (ctx) =>
+      Promise.all([
+        ctx.db.get(pointerId),
+        ctx.db
+          .query("managerSlots")
+          .withIndex("by_slot_number", (q) => q.eq("slotNumber", 0))
+          .unique(),
+        ctx.db.query("scannerState").first(),
+      ]),
+    );
+
+    // The scanner mutation should commit the pointer lease and slot ownership
+    // together, avoiding the old action query -> mutation decision gap.
+    expect(pointer?.leaseId).toBeDefined();
+    expect(slot?.leaseId).toBeDefined();
+    expect(slot?.pointerId).toBe(pointerId);
+    expect(slot?.queueId).toBe("queue-transactional-scanner");
+    expect(scannerState?.leaseId).not.toBe(scannerLeaseId);
+    expect(scannerState?.scheduledFunctionId).toBeDefined();
   });
 
   test("runManager finalizes pointer when manager slot claim fails", async () => {
@@ -1710,6 +1865,47 @@ describe("component runtime execution", () => {
     const pointer = await t.run(async (ctx) => ctx.db.get(pointerId));
     expect(pointer).not.toBeNull();
     expect(pointer?.vestingTime).toBe(delayedHeadVesting);
+  });
+
+  test("finalizePointer confirms vesting state before releasing leased pointer", async () => {
+    const t = initConvexTest();
+    const now = Date.now();
+    const queueId = "queue-finalize-confirms-vesting";
+    const pointerLeaseId = "pointer-lease-confirm-vesting";
+
+    const pointerId = await t.run(async (ctx) => {
+      await ctx.db.insert("queueItems", {
+        queueId,
+        priority: 1,
+        payload: { tag: "snapshot-visible-low-priority" },
+        handler: "low",
+        handlerType: "action",
+        vestingTime: now - 1_000,
+        errorCount: 0,
+      });
+      return await ctx.db.insert("queuePointers", {
+        queueId,
+        priority: 1,
+        vestingTime: now,
+        leaseId: pointerLeaseId,
+        leaseExpiry: now + 600_000,
+        lastActiveTime: now,
+      });
+    });
+
+    await t.mutation(testApi.insertThenFinalizePointer, {
+      pointerId,
+      pointerLeaseId,
+      queueId,
+    });
+
+    const pointer = await t.run(async (ctx) => ctx.db.get(pointerId));
+
+    // Snapshot finalization doesn't observe the caller's pending high-priority
+    // insert, so vesting mode must confirm before publishing the next pointer.
+    expect(pointer?.priority).toBe(15);
+    expect(pointer?.leaseId).toBeUndefined();
+    expect(pointer?.leaseExpiry).toBeUndefined();
   });
 
   test("finalizePointer keeps pointer priority when the same tier still has ready work", async () => {
