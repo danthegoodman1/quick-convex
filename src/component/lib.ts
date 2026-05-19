@@ -1,11 +1,6 @@
 import { v } from "convex/values"
 import { v7 as uuid } from "uuid"
 import { makeFunctionReference } from "convex/server"
-import type {
-  FunctionReference,
-  FunctionReturnType,
-  OptionalRestArgs,
-} from "convex/server"
 import {
   internalMutation,
   internalQuery,
@@ -16,6 +11,7 @@ import {
 } from "./_generated/server.js"
 import { internal } from "./_generated/api.js"
 import type { Id } from "./_generated/dataModel.js"
+import { runSnapshotQuery } from "./future.js"
 import schema from "./schema.js"
 
 export type QueueOrder = "vesting" | "fifo"
@@ -34,17 +30,6 @@ export const PRIORITY_LEVELS_DESC = Array.from(
   { length: MAX_PRIORITY - MIN_PRIORITY + 1 },
   (_, index) => MAX_PRIORITY - index
 )
-
-type SnapshotMutationCtx = MutationCtx & {
-  runSnapshotQuery<Query extends FunctionReference<"query", "public" | "internal">>(
-    query: Query,
-    ...args: OptionalRestArgs<Query>
-  ): Promise<FunctionReturnType<Query>>
-}
-
-function withSnapshotQueries(ctx: MutationCtx): SnapshotMutationCtx {
-  return ctx as SnapshotMutationCtx
-}
 
 export const retryBehaviorValidator = v.object({
   maxAttempts: v.number(),
@@ -1061,7 +1046,7 @@ export const dequeue = internalMutation({
     const leaseDurationMs = args.leaseDurationMs ?? config.defaultLeaseDurationMs
     const orderBy = (args.orderBy ?? config.defaultOrderBy) as QueueOrder
 
-    let availableItems = await withSnapshotQueries(ctx).runSnapshotQuery(
+    let availableItems = await runSnapshotQuery(
       getAvailableItemsSnapshotRef,
       {
         queueId: args.queueId,

@@ -1,12 +1,7 @@
 import { v } from "convex/values"
 import { v7 as uuid } from "uuid"
 import { makeFunctionReference } from "convex/server"
-import type {
-  FunctionHandle,
-  FunctionReference,
-  FunctionReturnType,
-  OptionalRestArgs,
-} from "convex/server"
+import type { FunctionHandle } from "convex/server"
 import {
   internalAction,
   internalMutation,
@@ -22,23 +17,13 @@ import {
   isTimeoutError,
   resolveConfig,
 } from "./lib.js"
+import { runSnapshotQuery } from "./future.js"
 
 const POINTER_OVERSCAN_MULTIPLIER = 5
 const MANAGER_SLOT_LEASE_MS = 600_000
 const OCC_RETRY_MAX_ATTEMPTS = 5
 const OCC_RETRY_BASE_DELAY_MS = 25
 const OCC_RETRY_MAX_DELAY_MS = 250
-
-type SnapshotMutationCtx = MutationCtx & {
-  runSnapshotQuery<Query extends FunctionReference<"query", "public" | "internal">>(
-    query: Query,
-    ...args: OptionalRestArgs<Query>
-  ): Promise<FunctionReturnType<Query>>
-}
-
-function withSnapshotQueries(ctx: MutationCtx): SnapshotMutationCtx {
-  return ctx as SnapshotMutationCtx
-}
 
 type ClaimablePointerSnapshot = {
   orderBy: "vesting" | "fifo"
@@ -643,7 +628,7 @@ async function claimAvailablePointersInTransaction(
     }
   }
 
-  const snapshot = await withSnapshotQueries(ctx).runSnapshotQuery(
+  const snapshot = await runSnapshotQuery(
     getClaimablePointerSnapshotRef,
     { now }
   )
@@ -1330,7 +1315,7 @@ export const finalizePointer = internalMutation({
     let nextPriority = DEFAULT_PRIORITY
     let nextLastActiveTime: number
 
-    let nextState = await withSnapshotQueries(ctx).runSnapshotQuery(
+    let nextState = await runSnapshotQuery(
       getPointerFinalizationSnapshotRef,
       {
         queueId: pointer.queueId,

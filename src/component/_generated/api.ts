@@ -9,6 +9,7 @@
  */
 
 import type * as crons from "../crons.js";
+import type * as future from "../future.js";
 import type * as lib from "../lib.js";
 import type * as scanner from "../scanner.js";
 
@@ -21,6 +22,7 @@ import { anyApi, componentsGeneric } from "convex/server";
 
 const fullApi: ApiFromModules<{
   crons: typeof crons;
+  future: typeof future;
   lib: typeof lib;
   scanner: typeof scanner;
 }> = anyApi as any;
