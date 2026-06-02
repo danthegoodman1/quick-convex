@@ -23,6 +23,71 @@ import type { FunctionReference } from "convex/server";
  */
 export type ComponentApi<Name extends string | undefined = string | undefined> =
   {
+    config: {
+      get: FunctionReference<
+        "query",
+        "internal",
+        {},
+        {
+          defaultLeaseDurationMs: number;
+          defaultOrderBy: "vesting" | "fifo";
+          defaultRetryBehavior: {
+            base: number;
+            initialBackoffMs: number;
+            maxAttempts: number;
+          };
+          managerSlots: number;
+          minInactiveBeforeDeleteMs: number;
+          pointerBatchSize: number;
+          retryByDefault: boolean;
+          scannerBackoffMaxMs: number;
+          scannerBackoffMinMs: number;
+          scannerLeaseDurationMs: number;
+          workersPerManager: number;
+        },
+        Name
+      >;
+      kick: FunctionReference<"mutation", "internal", {}, boolean, Name>;
+      update: FunctionReference<
+        "mutation",
+        "internal",
+        {
+          defaultLeaseDurationMs?: number;
+          defaultOrderBy?: "vesting" | "fifo";
+          defaultRetryBehavior?: {
+            base: number;
+            initialBackoffMs: number;
+            maxAttempts: number;
+          };
+          managerSlots?: number;
+          minInactiveBeforeDeleteMs?: number;
+          pointerBatchSize?: number;
+          retryByDefault?: boolean;
+          scannerBackoffMaxMs?: number;
+          scannerBackoffMinMs?: number;
+          scannerLeaseDurationMs?: number;
+          workersPerManager?: number;
+        },
+        {
+          defaultLeaseDurationMs: number;
+          defaultOrderBy: "vesting" | "fifo";
+          defaultRetryBehavior: {
+            base: number;
+            initialBackoffMs: number;
+            maxAttempts: number;
+          };
+          managerSlots: number;
+          minInactiveBeforeDeleteMs: number;
+          pointerBatchSize: number;
+          retryByDefault: boolean;
+          scannerBackoffMaxMs: number;
+          scannerBackoffMinMs: number;
+          scannerLeaseDurationMs: number;
+          workersPerManager: number;
+        },
+        Name
+      >;
+    };
     lib: {
       enqueue: FunctionReference<
         "mutation",

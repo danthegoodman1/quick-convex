@@ -71,7 +71,7 @@ export const configValidator = schema.tables.config.validator
 
 export type Config = typeof configValidator.type
 
-const resolvedConfigValidator = v.object({
+export const resolvedConfigValidator = v.object({
   scannerLeaseDurationMs: v.number(),
   scannerBackoffMinMs: v.number(),
   scannerBackoffMaxMs: v.number(),
@@ -138,6 +138,59 @@ function applyConfigDefaults(partial: Partial<Config> | null | undefined): Resol
 export async function resolveConfig(ctx: QueryCtx): Promise<ResolvedConfig> {
   const config = await ctx.db.query("config").first()
   return applyConfigDefaults(config)
+}
+
+function validateNonNegativeInteger(value: number | undefined, fieldName: string) {
+  if (value !== undefined && (!Number.isInteger(value) || value < 0)) {
+    throw new Error(`${fieldName} must be a non-negative integer`)
+  }
+}
+
+function validatePositiveInteger(value: number | undefined, fieldName: string) {
+  if (value !== undefined && (!Number.isInteger(value) || value < 1)) {
+    throw new Error(`${fieldName} must be a positive integer`)
+  }
+}
+
+function validateNonNegativeNumber(value: number | undefined, fieldName: string) {
+  if (value !== undefined && (!Number.isFinite(value) || value < 0)) {
+    throw new Error(`${fieldName} must be a non-negative number`)
+  }
+}
+
+function validatePositiveNumber(value: number | undefined, fieldName: string) {
+  if (value !== undefined && (!Number.isFinite(value) || value <= 0)) {
+    throw new Error(`${fieldName} must be a positive number`)
+  }
+}
+
+function validateRetryBehavior(retryBehavior: RetryBehavior | undefined) {
+  if (!retryBehavior) {
+    return
+  }
+
+  validatePositiveInteger(retryBehavior.maxAttempts, "defaultRetryBehavior.maxAttempts")
+  validateNonNegativeNumber(
+    retryBehavior.initialBackoffMs,
+    "defaultRetryBehavior.initialBackoffMs"
+  )
+  validatePositiveNumber(retryBehavior.base, "defaultRetryBehavior.base")
+}
+
+function validateConfigUpdates(updates: Partial<Config>, resolved: ResolvedConfig) {
+  validateNonNegativeInteger(updates.managerSlots, "managerSlots")
+  validatePositiveInteger(updates.workersPerManager, "workersPerManager")
+  validatePositiveInteger(updates.pointerBatchSize, "pointerBatchSize")
+  validatePositiveNumber(updates.scannerLeaseDurationMs, "scannerLeaseDurationMs")
+  validateNonNegativeNumber(updates.scannerBackoffMinMs, "scannerBackoffMinMs")
+  validateNonNegativeNumber(updates.scannerBackoffMaxMs, "scannerBackoffMaxMs")
+  validatePositiveNumber(updates.defaultLeaseDurationMs, "defaultLeaseDurationMs")
+  validateNonNegativeNumber(updates.minInactiveBeforeDeleteMs, "minInactiveBeforeDeleteMs")
+  validateRetryBehavior(updates.defaultRetryBehavior)
+
+  if (resolved.scannerBackoffMaxMs < resolved.scannerBackoffMinMs) {
+    throw new Error("scannerBackoffMaxMs must be greater than or equal to scannerBackoffMinMs")
+  }
 }
 
 function resolveVestingTime(
@@ -595,7 +648,7 @@ export const getResolvedConfig = internalQuery({
   handler: async (ctx) => resolveConfig(ctx),
 })
 
-async function resolveAndMaybeUpdateConfig(
+export async function resolveAndMaybeUpdateConfig(
   ctx: MutationCtx,
   updates: Config | undefined
 ): Promise<ResolvedConfig> {
@@ -608,6 +661,9 @@ async function resolveAndMaybeUpdateConfig(
   const sanitizedUpdates = Object.fromEntries(
     Object.entries(updates).filter(([, value]) => value !== undefined)
   ) as Partial<Config>
+  const merged = existing ? { ...existing, ...sanitizedUpdates } : sanitizedUpdates
+  const resolved = applyConfigDefaults(merged)
+  validateConfigUpdates(sanitizedUpdates, resolved)
 
   const fieldsToUpdate = Object.fromEntries(
     (Object.entries(sanitizedUpdates) as Array<[keyof Config, Config[keyof Config]]>).filter(
@@ -623,8 +679,7 @@ async function resolveAndMaybeUpdateConfig(
     }
   }
 
-  const merged = existing ? { ...existing, ...fieldsToUpdate } : fieldsToUpdate
-  return applyConfigDefaults(merged)
+  return resolved
 }
 
 export const updatePointerState = internalMutation({

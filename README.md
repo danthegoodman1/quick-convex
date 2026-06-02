@@ -56,6 +56,7 @@ import { components, api } from "./_generated/api";
 
 const quickVesting = new Quick(components.quickVesting, {
   defaultOrderBy: "vesting",
+  managerSlots: 10,
   workersPerManager: 25,
   retryByDefault: true,
   defaultRetryBehavior: {
@@ -186,6 +187,36 @@ export const enqueueEmail = mutation({
 - `retry: true` uses class/default retry behavior.
 - `retry: { maxAttempts, initialBackoffMs, base }` sets per-item behavior.
 
+### Runtime manager slots
+
+`managerSlots` controls how many manager actions may claim queue pointers at once.
+Set it to `0` to pause new work without enqueueing a placeholder item. Already
+running workers continue until they finish.
+
+```ts
+export const pauseQuick = mutation({
+  args: {},
+  handler: async (ctx) => {
+    await ctx.runMutation(components.quickVesting.config.update, {
+      managerSlots: 0,
+    });
+  },
+});
+
+export const resumeQuick = mutation({
+  args: {},
+  handler: async (ctx) => {
+    await ctx.runMutation(components.quickVesting.config.update, {
+      managerSlots: 10,
+    });
+    await ctx.runMutation(components.quickVesting.config.kick, {});
+  },
+});
+```
+
+If you use the class API, the same control is available as
+`quick.setManagerSlots(ctx, slots)` and `quick.kick(ctx)`.
+
 ### Priority in vesting mode
 
 - `priority` is optional on `enqueueAction`, `enqueueMutation`, and batch items.
@@ -199,6 +230,7 @@ export const enqueueEmail = mutation({
 - Supports `"vesting"` and `"fifo"` order modes.
 - Uses pointer-based scanning and leasing for concurrent processing.
 - `managerSlots` controls maximum concurrently running managers (default `10`).
+- `managerSlots: 0` pauses new manager claims until the value is raised and the scanner is kicked.
 - `workersPerManager` controls how many items a manager dequeues per `queueId` pass (default `10`).
 - Includes cron-based recovery and pointer garbage collection.
 

@@ -163,6 +163,11 @@ async function wakeScanner(
 ): Promise<boolean> {
   const config = await resolveConfig(ctx)
   const now = Date.now()
+
+  if (config.managerSlots <= 0) {
+    return false
+  }
+
   const state = await ctx.db.query("scannerState").first()
   const wasParked =
     state !== null &&
@@ -855,6 +860,17 @@ export const runScanner = internalMutation({
     }
 
     if (result.pointers.length === 0) {
+      if (config.managerSlots <= 0) {
+        await parkScannerInTransaction(
+          ctx,
+          {
+            leaseId: args.leaseId,
+          },
+          now
+        )
+        return null
+      }
+
       const confirmation = await getScannerInspectionForConfirmation(ctx, config, now)
       if (!confirmation.hasDuePointers) {
         await parkScannerInTransaction(

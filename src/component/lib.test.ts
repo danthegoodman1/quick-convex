@@ -1428,6 +1428,190 @@ describe("component runtime execution", () => {
     expect(scannerState?.scheduledFunctionId).toBeUndefined();
   });
 
+  test("managerSlots zero pauses new manager claims while keeping work queued", async () => {
+    const t = initConvexTest();
+    const queueId = "queue-paused-manager-slots";
+    const handle = await t.mutation(testApi.createWorkerHandle, {
+      type: "mutationExecNoProbe",
+    });
+
+    // Pausing should retain ready work without creating manager slots or
+    // requiring a placeholder enqueue to hold the queue open.
+    await t.mutation(api.config.update, {
+      managerSlots: 0,
+    });
+    await t.mutation(api.lib.enqueue, {
+      queueId,
+      payload: { ignored: true },
+      handler: handle,
+      handlerType: "mutation",
+    });
+
+    for (let i = 0; i < 3; i++) {
+      vi.advanceTimersByTime(0);
+      await t.finishInProgressScheduledFunctions();
+    }
+
+    const [items, pointers, slots, scannerState] = await t.run(async (ctx) =>
+      Promise.all([
+        ctx.db
+          .query("queueItems")
+          .withIndex("by_queue_priority_and_vesting_time", (q) => q.eq("queueId", queueId))
+          .collect(),
+        ctx.db
+          .query("queuePointers")
+          .withIndex("by_queue", (q) => q.eq("queueId", queueId))
+          .collect(),
+        ctx.db.query("managerSlots").withIndex("by_slot_number").collect(),
+        ctx.db.query("scannerState").first(),
+      ]),
+    );
+
+    expect(executionsByQueueId.has(queueId)).toBe(false);
+    expect(items).toHaveLength(1);
+    expect(pointers).toHaveLength(1);
+    expect(slots).toHaveLength(0);
+    expect(scannerState?.leaseId).toBeUndefined();
+    expect(scannerState?.scheduledFunctionId).toBeUndefined();
+  });
+
+  test("managerSlots resume and kick processes already queued work", async () => {
+    const t = initConvexTest();
+    const queueId = "queue-resume-manager-slots";
+    const handle = await t.mutation(testApi.createWorkerHandle, {
+      type: "mutationExecNoProbe",
+    });
+
+    // Resume should process the existing backlog after a kick, so callers do
+    // not need to enqueue dummy work just to wake the scanner.
+    await t.mutation(api.config.update, {
+      managerSlots: 0,
+    });
+    await t.mutation(api.lib.enqueue, {
+      queueId,
+      payload: { ignored: true },
+      handler: handle,
+      handlerType: "mutation",
+    });
+    await t.mutation(api.config.update, {
+      managerSlots: 1,
+    });
+    await t.mutation(api.config.kick, {});
+
+    for (let i = 0; i < 4; i++) {
+      vi.advanceTimersByTime(0);
+      await t.finishInProgressScheduledFunctions();
+    }
+
+    const [items, scannerState, slot] = await t.run(async (ctx) =>
+      Promise.all([
+        ctx.db
+          .query("queueItems")
+          .withIndex("by_queue_priority_and_vesting_time", (q) => q.eq("queueId", queueId))
+          .collect(),
+        ctx.db.query("scannerState").first(),
+        ctx.db
+          .query("managerSlots")
+          .withIndex("by_slot_number", (q) => q.eq("slotNumber", 0))
+          .unique(),
+      ]),
+    );
+
+    expect(executionsByQueueId.get(queueId)).toBe("mutation");
+    expect(items).toHaveLength(0);
+    expect(scannerState?.scheduledFunctionId).toBeUndefined();
+    expect(slot?.leaseId).toBeUndefined();
+    expect(slot?.leaseExpiry).toBeUndefined();
+  });
+
+  test("runtime config rejects values that break scheduler invariants", async () => {
+    const t = initConvexTest();
+
+    // Runtime config is user-controlled, so reject values that would create
+    // zero-sized batches, negative scheduling delays, or invalid retry backoff.
+    const invalidUpdates = [
+      {
+        args: { managerSlots: -1 },
+        message: "managerSlots must be a non-negative integer",
+      },
+      {
+        args: { workersPerManager: 0 },
+        message: "workersPerManager must be a positive integer",
+      },
+      {
+        args: { pointerBatchSize: 0 },
+        message: "pointerBatchSize must be a positive integer",
+      },
+      {
+        args: { scannerLeaseDurationMs: 0 },
+        message: "scannerLeaseDurationMs must be a positive number",
+      },
+      {
+        args: { scannerBackoffMinMs: -1 },
+        message: "scannerBackoffMinMs must be a non-negative number",
+      },
+      {
+        args: { scannerBackoffMinMs: 10, scannerBackoffMaxMs: 5 },
+        message: "scannerBackoffMaxMs must be greater than or equal to scannerBackoffMinMs",
+      },
+      {
+        args: { defaultLeaseDurationMs: 0 },
+        message: "defaultLeaseDurationMs must be a positive number",
+      },
+      {
+        args: { minInactiveBeforeDeleteMs: -1 },
+        message: "minInactiveBeforeDeleteMs must be a non-negative number",
+      },
+      {
+        args: {
+          defaultRetryBehavior: {
+            maxAttempts: 0,
+            initialBackoffMs: 250,
+            base: 2,
+          },
+        },
+        message: "defaultRetryBehavior.maxAttempts must be a positive integer",
+      },
+      {
+        args: {
+          defaultRetryBehavior: {
+            maxAttempts: 5,
+            initialBackoffMs: -1,
+            base: 2,
+          },
+        },
+        message: "defaultRetryBehavior.initialBackoffMs must be a non-negative number",
+      },
+      {
+        args: {
+          defaultRetryBehavior: {
+            maxAttempts: 5,
+            initialBackoffMs: 250,
+            base: 0,
+          },
+        },
+        message: "defaultRetryBehavior.base must be a positive number",
+      },
+    ];
+
+    for (const invalidUpdate of invalidUpdates) {
+      await expect(t.mutation(api.config.update, invalidUpdate.args)).rejects.toThrow(
+        invalidUpdate.message,
+      );
+    }
+
+    await expect(
+      t.mutation(api.lib.enqueue, {
+        queueId: "queue-invalid-workers-per-manager",
+        payload: { ignored: true },
+        handler: "noop",
+        config: {
+          workersPerManager: 0,
+        },
+      }),
+    ).rejects.toThrow("workersPerManager must be a positive integer");
+  });
+
   test("enqueue recovers stale leased pointer and manager slot so ready work runs promptly", async () => {
     const t = initConvexTest();
     const now = Date.now();

@@ -8,6 +8,7 @@
  * @module
  */
 
+import type * as config from "../config.js";
 import type * as crons from "../crons.js";
 import type * as future from "../future.js";
 import type * as lib from "../lib.js";
@@ -21,6 +22,7 @@ import type {
 import { anyApi, componentsGeneric } from "convex/server";
 
 const fullApi: ApiFromModules<{
+  config: typeof config;
   crons: typeof crons;
   future: typeof future;
   lib: typeof lib;

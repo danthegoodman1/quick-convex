@@ -80,6 +80,7 @@ export type QuickOptions = {
   defaultOrderBy?: QuickOrder;
   retryByDefault?: boolean;
   defaultRetryBehavior?: RetryBehavior;
+  managerSlots?: number;
   workersPerManager?: number;
 };
 
@@ -193,6 +194,7 @@ export class Quick {
     defaultOrderBy?: QuickOrder;
     retryByDefault?: boolean;
     defaultRetryBehavior?: RetryBehavior;
+    managerSlots?: number;
     workersPerManager?: number;
   };
 
@@ -209,6 +211,7 @@ export class Quick {
       defaultOrderBy?: QuickOrder;
       retryByDefault?: boolean;
       defaultRetryBehavior?: RetryBehavior;
+      managerSlots?: number;
       workersPerManager?: number;
     } = {};
 
@@ -220,6 +223,9 @@ export class Quick {
     }
     if (options.defaultRetryBehavior !== undefined) {
       config.defaultRetryBehavior = options.defaultRetryBehavior;
+    }
+    if (options.managerSlots !== undefined) {
+      config.managerSlots = options.managerSlots;
     }
     if (options.workersPerManager !== undefined) {
       config.workersPerManager = options.workersPerManager;
@@ -246,6 +252,16 @@ export class Quick {
     request: EnqueueMutationRequest<Fn, OnCompleteFn>,
   ) {
     return await this.enqueueWithType(ctx, request, "mutation");
+  }
+
+  async setManagerSlots(ctx: QuickCtx, managerSlots: number) {
+    return await ctx.runMutation(this.component.config.update, {
+      managerSlots,
+    });
+  }
+
+  async kick(ctx: QuickCtx) {
+    return await ctx.runMutation(this.component.config.kick, {});
   }
 
   async enqueueBatchAction<

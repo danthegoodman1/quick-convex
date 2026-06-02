@@ -71,6 +71,7 @@ function makeComponentApiMock() {
       config?: {
         defaultOrderBy?: "vesting" | "fifo";
         retryByDefault?: boolean;
+        managerSlots?: number;
         workersPerManager?: number;
         defaultRetryBehavior?: {
           maxAttempts: number;
@@ -104,6 +105,7 @@ function makeComponentApiMock() {
       config?: {
         defaultOrderBy?: "vesting" | "fifo";
         retryByDefault?: boolean;
+        managerSlots?: number;
         workersPerManager?: number;
         defaultRetryBehavior?: {
           maxAttempts: number;
@@ -114,10 +116,25 @@ function makeComponentApiMock() {
     }
   >("component.lib:enqueueBatch");
 
+  const configUpdateRef = makeFunctionReference<
+    "mutation",
+    {
+      managerSlots?: number;
+    }
+  >("component.config:update");
+
+  const configKickRef = makeFunctionReference<"mutation", Record<string, never>>(
+    "component.config:kick",
+  );
+
   return {
     lib: {
       enqueue: enqueueRef,
       enqueueBatch: enqueueBatchRef,
+    },
+    config: {
+      update: configUpdateRef,
+      kick: configKickRef,
     },
   } as unknown as ComponentApi;
 }
@@ -399,6 +416,7 @@ describe("Quick client", () => {
     const quick = new Quick(component, {
       defaultOrderBy: "fifo",
       retryByDefault: true,
+      managerSlots: 7,
       workersPerManager: 42,
       defaultRetryBehavior: {
         maxAttempts: 9,
@@ -439,6 +457,7 @@ describe("Quick client", () => {
       config: {
         defaultOrderBy: "fifo",
         retryByDefault: true,
+        managerSlots: 7,
         workersPerManager: 42,
         defaultRetryBehavior: {
           maxAttempts: 9,
@@ -470,6 +489,7 @@ describe("Quick client", () => {
         config: {
           defaultOrderBy: "fifo",
           retryByDefault: true,
+          managerSlots: 7,
           workersPerManager: 42,
           defaultRetryBehavior: {
             maxAttempts: 9,
@@ -479,6 +499,22 @@ describe("Quick client", () => {
         },
       },
     );
+  });
+
+  test("setManagerSlots and kick call component config functions", async () => {
+    const ctx = makeCtxMock();
+    const component = makeComponentApiMock();
+    const quick = new Quick(component);
+    ctx.runMutation.mockResolvedValueOnce({ managerSlots: 0 });
+    ctx.runMutation.mockResolvedValueOnce(true);
+
+    await quick.setManagerSlots(ctx, 0);
+    await quick.kick(ctx);
+
+    expect(ctx.runMutation).toHaveBeenNthCalledWith(1, component.config.update, {
+      managerSlots: 0,
+    });
+    expect(ctx.runMutation).toHaveBeenNthCalledWith(2, component.config.kick, {});
   });
 
   test("enqueueBatchAction forwards item priorities", async () => {
