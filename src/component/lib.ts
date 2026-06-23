@@ -436,6 +436,7 @@ async function upsertPointerStateIfBetter(
     candidate: PointerState
     now: number
     wakeReason: "enqueue" | "pointerReady"
+    wakeIfReady?: boolean
   }
 ) {
   const pointer = await ctx.db
@@ -444,11 +445,18 @@ async function upsertPointerStateIfBetter(
     .unique()
 
   if (!pointer) {
-    await ctx.db.insert("queuePointers", {
+    const pointerId = await ctx.db.insert("queuePointers", {
       queueId: args.queueId,
       priority: args.candidate.priority,
       vestingTime: args.candidate.vestingTime,
       lastActiveTime: args.now,
+    })
+    console.info("[quick] pointer created", {
+      queueId: args.queueId,
+      pointerId,
+      priority: args.candidate.priority,
+      vestingTime: args.candidate.vestingTime,
+      wakeReason: args.wakeReason,
     })
     await ctx.scheduler.runAfter(0, internal.scanner.tryWakeScanner, {
       reason: args.wakeReason,
@@ -481,6 +489,20 @@ async function upsertPointerStateIfBetter(
   }
 
   if (!candidateShouldPromote) {
+    if (args.wakeIfReady && pointer.vestingTime <= args.now) {
+      console.info("[quick] pointer already ready; waking scanner", {
+        queueId: args.queueId,
+        pointerId: pointer._id,
+        pointerPriority: pointer.priority,
+        pointerVestingTime: pointer.vestingTime,
+        candidatePriority: args.candidate.priority,
+        candidateVestingTime: args.candidate.vestingTime,
+        wakeReason: args.wakeReason,
+      })
+      await ctx.scheduler.runAfter(0, internal.scanner.tryWakeScanner, {
+        reason: args.wakeReason,
+      })
+    }
     return
   }
 
@@ -489,36 +511,46 @@ async function upsertPointerStateIfBetter(
     vestingTime: args.candidate.vestingTime,
     lastActiveTime: args.now,
   })
+  console.info("[quick] pointer promoted", {
+    queueId: args.queueId,
+    pointerId: pointer._id,
+    previousPriority: pointer.priority,
+    previousVestingTime: pointer.vestingTime,
+    nextPriority: args.candidate.priority,
+    nextVestingTime: args.candidate.vestingTime,
+    wakeReason: args.wakeReason,
+  })
   await ctx.scheduler.runAfter(0, internal.scanner.tryWakeScanner, {
     reason: args.wakeReason,
   })
 }
 
-async function ensureQueuePointer(
+async function refreshFifoPointerState(
   ctx: MutationCtx,
   args: {
     queueId: string
-    vestingTime: number
     now: number
+    wakeReason: "enqueue" | "pointerReady"
   }
 ) {
-  const pointer = await ctx.db
-    .query("queuePointers")
-    .withIndex("by_queue", (q) => q.eq("queueId", args.queueId))
-    .unique()
+  const head = await ctx.db
+    .query("queueItems")
+    .withIndex("by_queue_fifo", (q) => q.eq("queueId", args.queueId))
+    .first()
 
-  if (pointer) {
+  if (!head) {
     return
   }
 
-  await ctx.db.insert("queuePointers", {
+  await upsertPointerStateIfBetter(ctx, {
     queueId: args.queueId,
-    priority: DEFAULT_PRIORITY,
-    vestingTime: args.vestingTime,
-    lastActiveTime: args.now,
-  })
-  await ctx.scheduler.runAfter(0, internal.scanner.tryWakeScanner, {
-    reason: "enqueue",
+    candidate: {
+      priority: DEFAULT_PRIORITY,
+      vestingTime: head.vestingTime,
+    },
+    now: args.now,
+    wakeReason: args.wakeReason,
+    wakeIfReady: true,
   })
 }
 
@@ -755,10 +787,10 @@ export const enqueue = mutation({
         wakeReason: "enqueue",
       })
     } else {
-      await ensureQueuePointer(ctx, {
+      await refreshFifoPointerState(ctx, {
         queueId: args.queueId,
-        vestingTime,
         now,
+        wakeReason: "enqueue",
       })
     }
 
@@ -794,7 +826,7 @@ export const enqueueBatch = mutation({
     const now = Date.now()
     const itemIds: Array<typeof schema.tables.queueItems.validator.type & { _id: string }> = []
     const pointerUpdates = new Map<string, PointerState>()
-    const queuesNeedingPointerEnsure = new Map<string, number>()
+    const queuesNeedingFifoPointerRefresh = new Set<string>()
 
     for (const item of args.items) {
       const vestingTime = resolveVestingTime(now, item)
@@ -828,10 +860,7 @@ export const enqueueBatch = mutation({
           pointerUpdates.set(item.queueId, candidate)
         }
       } else {
-        const existingVestingTime = queuesNeedingPointerEnsure.get(item.queueId)
-        if (existingVestingTime === undefined || vestingTime < existingVestingTime) {
-          queuesNeedingPointerEnsure.set(item.queueId, vestingTime)
-        }
+        queuesNeedingFifoPointerRefresh.add(item.queueId)
       }
     }
 
@@ -845,11 +874,11 @@ export const enqueueBatch = mutation({
         })
       }
     } else {
-      for (const [queueId, vestingTime] of queuesNeedingPointerEnsure) {
-        await ensureQueuePointer(ctx, {
+      for (const queueId of queuesNeedingFifoPointerRefresh) {
+        await refreshFifoPointerState(ctx, {
           queueId,
-          vestingTime,
           now,
+          wakeReason: "enqueue",
         })
       }
     }

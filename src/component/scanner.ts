@@ -165,6 +165,11 @@ async function wakeScanner(
   const now = Date.now()
 
   if (config.managerSlots <= 0) {
+    console.info("[quick] scanner wake skipped", {
+      reason: opts.reason ?? "watchdog",
+      skipReason: "managerSlotsDisabled",
+      managerSlots: config.managerSlots,
+    })
     return false
   }
 
@@ -174,15 +179,32 @@ async function wakeScanner(
     (state.leaseExpiry === undefined || state.leaseExpiry <= now)
 
   if (state && state.leaseExpiry && state.leaseExpiry > now) {
+    console.info("[quick] scanner wake skipped", {
+      reason: opts.reason ?? "watchdog",
+      skipReason: "activeScannerLease",
+      leaseExpiry: state.leaseExpiry,
+      now,
+    })
     return false
   }
 
   if (opts.checkForWork) {
-    const hasWork = await ctx.db
+    const duePointer = await ctx.db
       .query("queuePointers")
       .withIndex("by_vesting", (q) => q.lte("vestingTime", now))
       .first()
-    if (!hasWork) {
+    if (!duePointer) {
+      const nextPointer = await ctx.db
+        .query("queuePointers")
+        .withIndex("by_vesting")
+        .first()
+      console.info("[quick] scanner wake skipped", {
+        reason: opts.reason ?? "watchdog",
+        skipReason: "noDuePointers",
+        nextPointerQueueId: nextPointer?.queueId ?? null,
+        nextPointerVestingTime: nextPointer?.vestingTime ?? null,
+        now,
+      })
       return false
     }
   }
@@ -213,6 +235,12 @@ async function wakeScanner(
   if (opts.reason === "enqueue" && wasParked) {
     console.info("[quick] enqueue woke parked scanner")
   }
+  console.info("[quick] scanner wake scheduled", {
+    reason: opts.reason ?? "watchdog",
+    wasParked,
+    leaseExpiry,
+    scheduledFunctionId: scheduledId,
+  })
 
   return true
 }
@@ -535,6 +563,10 @@ async function parkScannerInTransaction(
   }
 
   const delayMs = Math.max(0, args.nextPointerVestingTime - now)
+  console.info("[quick] scanner parked until next pointer", {
+    nextPointerVestingTime: args.nextPointerVestingTime,
+    delayMs,
+  })
   const scheduledId = await ctx.scheduler.runAfter(
     delayMs,
     internal.scanner.watchdogRecoverScanner,

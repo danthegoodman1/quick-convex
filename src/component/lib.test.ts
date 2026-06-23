@@ -1428,6 +1428,53 @@ describe("component runtime execution", () => {
     expect(scannerState?.scheduledFunctionId).toBeUndefined();
   });
 
+  test("fifo enqueue wakes a queue whose empty pointer is parked for GC", async () => {
+    const t = initConvexTest();
+    const queueId = "queue-fifo-reopen-after-empty";
+    const now = Date.now();
+    const handle = await t.mutation(testApi.createWorkerHandle, {
+      type: "mutationExecNoProbe",
+    });
+
+    await t.run(async (ctx) => {
+      await ctx.db.insert("config", {
+        defaultOrderBy: "fifo",
+        managerSlots: 1,
+        workersPerManager: 1,
+      });
+      await ctx.db.insert("queuePointers", {
+        queueId,
+        priority: 0,
+        vestingTime: now + 60_000,
+        lastActiveTime: now,
+      });
+    });
+
+    // A drained FIFO queue keeps its pointer until GC. Reopening it should
+    // promote the pointer immediately instead of waiting for the GC timestamp.
+    await t.mutation(api.lib.enqueue, {
+      queueId,
+      payload: { ignored: true },
+      handler: handle,
+      handlerType: "mutation",
+    });
+
+    for (let i = 0; i < 4; i++) {
+      vi.advanceTimersByTime(0);
+      await t.finishInProgressScheduledFunctions();
+    }
+
+    const items = await t.run(async (ctx) =>
+      ctx.db
+        .query("queueItems")
+        .withIndex("by_queue_priority_and_vesting_time", (q) => q.eq("queueId", queueId))
+        .collect(),
+    );
+
+    expect(executionsByQueueId.get(queueId)).toBe("mutation");
+    expect(items).toHaveLength(0);
+  });
+
   test("managerSlots zero pauses new manager claims while keeping work queued", async () => {
     const t = initConvexTest();
     const queueId = "queue-paused-manager-slots";
