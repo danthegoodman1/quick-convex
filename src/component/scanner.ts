@@ -42,6 +42,7 @@ type ClaimablePointerSnapshot = {
 
 type PointerFinalizationSnapshot = {
   hasItems: boolean
+  componentHasItems: boolean
   state: {
     priority: number
     vestingTime: number
@@ -246,13 +247,13 @@ async function wakeScanner(
 }
 
 async function clearScannerScheduleIfComponentIdle(ctx: MutationCtx) {
-  const state = await ctx.db.query("scannerState").first()
-  if (!state) {
+  const remainingItem = await ctx.db.query("queueItems").first()
+  if (remainingItem) {
     return
   }
 
-  const remainingItem = await ctx.db.query("queueItems").first()
-  if (remainingItem) {
+  const state = await ctx.db.query("scannerState").first()
+  if (!state) {
     return
   }
 
@@ -832,6 +833,7 @@ export const getPointerFinalizationSnapshot = internalQuery({
   },
   returns: v.object({
     hasItems: v.boolean(),
+    componentHasItems: v.boolean(),
     state: v.union(
       v.null(),
       v.object({
@@ -841,12 +843,26 @@ export const getPointerFinalizationSnapshot = internalQuery({
       })
     ),
   }),
-  handler: async (ctx, args) =>
-    await computePointerFinalizationState(ctx.db, {
+  handler: async (ctx, args) => {
+    const state = await computePointerFinalizationState(ctx.db, {
       queueId: args.queueId,
       orderBy: args.orderBy,
       now: args.now,
-    }),
+    })
+
+    if (state.hasItems) {
+      return {
+        ...state,
+        componentHasItems: true,
+      }
+    }
+
+    const remainingItem = await ctx.db.query("queueItems").first()
+    return {
+      ...state,
+      componentHasItems: remainingItem !== null,
+    }
+  },
 })
 
 export const claimAvailablePointers = internalMutation({
@@ -1363,7 +1379,7 @@ export const finalizePointer = internalMutation({
     let nextPriority = DEFAULT_PRIORITY
     let nextLastActiveTime: number
 
-    let nextState = await runSnapshotQuery(
+    const snapshot = await runSnapshotQuery(
       getPointerFinalizationSnapshotRef,
       {
         queueId: pointer.queueId,
@@ -1371,6 +1387,8 @@ export const finalizePointer = internalMutation({
         now,
       }
     )
+    const { componentHasItems, ...snapshotState } = snapshot
+    let nextState = snapshotState
 
     if (args.orderBy === "vesting" || pointerStateNeedsConfirmation(nextState, now)) {
       // Enqueues skip promotion while a pointer is actively leased, so vesting
@@ -1423,10 +1441,12 @@ export const finalizePointer = internalMutation({
       await ctx.scheduler.runAfter(0, internal.scanner.tryWakeScanner, {
         reason: "pointerReady",
       })
-    } else {
+    } else if (!componentHasItems) {
       // Once the last queue item drains, there is no useful work left for the
-      // scanner to poll. Clear any follow-up wake so convex-test doesn't keep
-      // a stale scheduled function alive past test completion.
+      // scanner to poll. The snapshot keeps this component-wide check out of
+      // the finalization transaction while work remains elsewhere. If the
+      // snapshot appears idle, confirm transactionally before clearing the
+      // scanner so a concurrent enqueue cannot lose its wake.
       await clearScannerScheduleIfComponentIdle(ctx)
     }
 

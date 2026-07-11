@@ -364,12 +364,42 @@ export const insertThenFinalizePointer = mutation({
   },
 });
 
+export const insertOtherQueueItemThenFinalizePointer = mutation({
+  args: {
+    pointerId: v.id("queuePointers"),
+    pointerLeaseId: v.string(),
+    otherQueueId: v.string(),
+  },
+  returns: v.null(),
+  handler: async (ctx, args) => {
+    await ctx.db.insert("queueItems", {
+      queueId: args.otherQueueId,
+      priority: 0,
+      payload: { insertedInCaller: true },
+      handler: "noop",
+      handlerType: "action",
+      vestingTime: Date.now() + 60_000,
+      errorCount: 0,
+    });
+
+    await ctx.runMutation(finalizePointerRef, {
+      pointerId: args.pointerId,
+      pointerLeaseId: args.pointerLeaseId,
+      isEmpty: true,
+      orderBy: "vesting",
+    });
+
+    return null;
+  },
+});
+
 const testApi = (
   anyApi as unknown as ApiFromModules<{
     "lib.test": {
       createWorkerHandle: typeof createWorkerHandle;
       insertThenDequeue: typeof insertThenDequeue;
       insertThenFinalizePointer: typeof insertThenFinalizePointer;
+      insertOtherQueueItemThenFinalizePointer: typeof insertOtherQueueItemThenFinalizePointer;
     };
   }>
 )["lib.test"];
@@ -2137,6 +2167,62 @@ describe("component runtime execution", () => {
     expect(pointer?.priority).toBe(15);
     expect(pointer?.leaseId).toBeUndefined();
     expect(pointer?.leaseExpiry).toBeUndefined();
+  });
+
+  test("finalizePointer confirms component idleness before clearing the scanner schedule", async () => {
+    const t = initConvexTest();
+    const now = Date.now();
+    const pointerLeaseId = "pointer-lease-confirm-component-idle";
+
+    const { pointerId, scheduledFunctionId } = await t.run(async (ctx) => {
+      const scheduledFunctionId = await ctx.scheduler.runAfter(
+        60_000,
+        internal.scanner.watchdogRecoverScanner,
+        {},
+      );
+      await ctx.db.insert("scannerState", {
+        leaseId: "scanner-lease-confirm-component-idle",
+        leaseExpiry: now + 30_000,
+        scheduledFunctionId,
+        lastRunAt: now,
+      });
+      const pointerId = await ctx.db.insert("queuePointers", {
+        queueId: "queue-finalize-confirm-component-idle",
+        priority: 0,
+        vestingTime: now,
+        leaseId: pointerLeaseId,
+        leaseExpiry: now + 30_000,
+        lastActiveTime: now,
+      });
+      return { pointerId, scheduledFunctionId };
+    });
+
+    // Snapshot queries cannot see this caller transaction's pending insert.
+    // The idle cleanup must confirm against the transaction before clearing
+    // scanner state, otherwise this work could lose its scheduled wake.
+    await t.mutation(testApi.insertOtherQueueItemThenFinalizePointer, {
+      pointerId,
+      pointerLeaseId,
+      otherQueueId: "queue-inserted-while-finalizing",
+    });
+
+    const [scannerState, scheduledFunction, remainingItem] = await t.run(async (ctx) =>
+      Promise.all([
+        ctx.db.query("scannerState").first(),
+        ctx.db.system.get("_scheduled_functions", scheduledFunctionId),
+        ctx.db
+          .query("queueItems")
+          .withIndex("by_queue_fifo", (q) =>
+            q.eq("queueId", "queue-inserted-while-finalizing"),
+          )
+          .first(),
+      ]),
+    );
+
+    expect(remainingItem).not.toBeNull();
+    expect(scannerState?.scheduledFunctionId).toBe(scheduledFunctionId);
+    expect(scannerState?.leaseId).toBe("scanner-lease-confirm-component-idle");
+    expect(scheduledFunction?.state.kind).toBe("pending");
   });
 
   test("finalizePointer keeps pointer priority when the same tier still has ready work", async () => {
