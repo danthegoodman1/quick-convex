@@ -51,6 +51,12 @@ const queueItemValidator = schema.tables.queueItems.validator.extend({
 
 type QueueItem = typeof queueItemValidator.type
 
+const getFifoHeadSnapshotRef = makeFunctionReference<
+  "query",
+  { queueId: string },
+  QueueItem | null
+>("lib:getFifoHeadSnapshot")
+
 const getAvailableItemsSnapshotRef = makeFunctionReference<
   "query",
   {
@@ -362,6 +368,19 @@ async function recoverStalePointerLeaseIfNeeded(
   const config = await resolveConfig(ctx)
   const leaseAgeMs = Math.max(0, args.now - args.pointer.lastActiveTime)
 
+  if (leaseAgeMs < config.scannerBackoffMaxMs) {
+    if (args.wakeReason === "enqueue") {
+      console.info("[quick] enqueue skipped pointer promotion because pointer lease is still within recovery grace", {
+        queueId: args.pointer.queueId,
+        pointerId: args.pointer._id,
+        pointerLeaseExpiry: args.pointer.leaseExpiry,
+        leaseAgeMs,
+        recoveryGraceMs: config.scannerBackoffMaxMs,
+      })
+    }
+    return false
+  }
+
   const hasActiveLeasedItems = await hasActiveLeasedItemsForQueue(
     ctx.db,
     args.pointer.queueId,
@@ -373,19 +392,6 @@ async function recoverStalePointerLeaseIfNeeded(
         queueId: args.pointer.queueId,
         pointerId: args.pointer._id,
         pointerLeaseExpiry: args.pointer.leaseExpiry,
-      })
-    }
-    return false
-  }
-
-  if (leaseAgeMs < config.scannerBackoffMaxMs) {
-    if (args.wakeReason === "enqueue") {
-      console.info("[quick] enqueue skipped pointer promotion because pointer lease is still within recovery grace", {
-        queueId: args.pointer.queueId,
-        pointerId: args.pointer._id,
-        pointerLeaseExpiry: args.pointer.leaseExpiry,
-        leaseAgeMs,
-        recoveryGraceMs: config.scannerBackoffMaxMs,
       })
     }
     return false
@@ -529,24 +535,25 @@ async function refreshFifoPointerState(
   ctx: MutationCtx,
   args: {
     queueId: string
+    pendingHeadVestingTime: number
     now: number
     wakeReason: "enqueue" | "pointerReady"
   }
 ) {
-  const head = await ctx.db
-    .query("queueItems")
-    .withIndex("by_queue_fifo", (q) => q.eq("queueId", args.queueId))
-    .first()
-
-  if (!head) {
-    return
-  }
+  // This is a scheduling hint, not the authority on what may run. Keeping the
+  // head read out of the enqueue transaction's read set lets a concurrent
+  // dequeue lease that head without forcing enqueue through OCC retries.
+  // Snapshot queries cannot see pending writes, so an empty snapshot means the
+  // first item inserted for this queue in the current transaction is the head.
+  const committedHead = await runSnapshotQuery(getFifoHeadSnapshotRef, {
+    queueId: args.queueId,
+  })
 
   await upsertPointerStateIfBetter(ctx, {
     queueId: args.queueId,
     candidate: {
       priority: DEFAULT_PRIORITY,
-      vestingTime: head.vestingTime,
+      vestingTime: committedHead?.vestingTime ?? args.pendingHeadVestingTime,
     },
     now: args.now,
     wakeReason: args.wakeReason,
@@ -766,6 +773,7 @@ export const enqueue = mutation({
 
     const itemId = await ctx.db.insert("queueItems", {
       queueId: args.queueId,
+      enqueueTs: ctx.db.vars.commitTs,
       priority,
       payload: args.payload,
       handler: args.handler,
@@ -789,6 +797,7 @@ export const enqueue = mutation({
     } else {
       await refreshFifoPointerState(ctx, {
         queueId: args.queueId,
+        pendingHeadVestingTime: vestingTime,
         now,
         wakeReason: "enqueue",
       })
@@ -826,7 +835,7 @@ export const enqueueBatch = mutation({
     const now = Date.now()
     const itemIds: Array<typeof schema.tables.queueItems.validator.type & { _id: string }> = []
     const pointerUpdates = new Map<string, PointerState>()
-    const queuesNeedingFifoPointerRefresh = new Set<string>()
+    const fifoPendingHeadVestingTimes = new Map<string, number>()
 
     for (const item of args.items) {
       const vestingTime = resolveVestingTime(now, item)
@@ -838,6 +847,7 @@ export const enqueueBatch = mutation({
 
       const itemId = await ctx.db.insert("queueItems", {
         queueId: item.queueId,
+        enqueueTs: ctx.db.vars.commitTs,
         priority,
         payload: item.payload,
         handler: item.handler,
@@ -860,7 +870,9 @@ export const enqueueBatch = mutation({
           pointerUpdates.set(item.queueId, candidate)
         }
       } else {
-        queuesNeedingFifoPointerRefresh.add(item.queueId)
+        if (!fifoPendingHeadVestingTimes.has(item.queueId)) {
+          fifoPendingHeadVestingTimes.set(item.queueId, vestingTime)
+        }
       }
     }
 
@@ -874,9 +886,10 @@ export const enqueueBatch = mutation({
         })
       }
     } else {
-      for (const queueId of queuesNeedingFifoPointerRefresh) {
+      for (const [queueId, pendingHeadVestingTime] of fifoPendingHeadVestingTimes) {
         await refreshFifoPointerState(ctx, {
           queueId,
+          pendingHeadVestingTime,
           now,
           wakeReason: "enqueue",
         })
@@ -1007,6 +1020,18 @@ async function collectAvailableItems(
 
   return availableItems
 }
+
+export const getFifoHeadSnapshot = internalQuery({
+  args: {
+    queueId: v.string(),
+  },
+  returns: v.union(v.null(), queueItemValidator),
+  handler: async (ctx, args) =>
+    await ctx.db
+      .query("queueItems")
+      .withIndex("by_queue_fifo", (q) => q.eq("queueId", args.queueId))
+      .first(),
+})
 
 export const getAvailableItemsSnapshot = internalQuery({
   args: {

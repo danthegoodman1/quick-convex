@@ -1067,6 +1067,156 @@ describe("component runtime execution", () => {
     expect(secondLease).toHaveLength(0);
   });
 
+  test("fifo order uses commit timestamps while legacy items drain first", async () => {
+    const t = initConvexTest();
+    const queueId = "queue-fifo-commit-order";
+
+    await t.mutation(api.config.update, {
+      defaultOrderBy: "fifo",
+      managerSlots: 0,
+    });
+
+    const legacyItemId = await t.run(async (ctx) =>
+      ctx.db.insert("queueItems", {
+        queueId,
+        priority: 0,
+        payload: { tag: "legacy" },
+        handler: "noop",
+        handlerType: "action",
+        vestingTime: 0,
+        errorCount: 0,
+      }),
+    );
+
+    const firstTimestampedItemId = await t.mutation(api.lib.enqueue, {
+      queueId,
+      payload: { tag: "first-timestamped" },
+      handler: "noop",
+      handlerType: "action",
+    });
+    const batchItemIds = await t.mutation(api.lib.enqueueBatch, {
+      items: [
+        {
+          queueId,
+          payload: { tag: "batch-first" },
+          handler: "noop",
+          handlerType: "action",
+        },
+        {
+          queueId,
+          payload: { tag: "batch-second" },
+          handler: "noop",
+          handlerType: "action",
+        },
+      ],
+    });
+
+    const items = await t.run(async (ctx) =>
+      ctx.db
+        .query("queueItems")
+        .withIndex("by_queue_fifo", (q) => q.eq("queueId", queueId))
+        .collect(),
+    );
+
+    expect(items.map((item) => item._id)).toEqual([
+      legacyItemId,
+      firstTimestampedItemId,
+      ...batchItemIds,
+    ]);
+    const firstCommitTs = items[1]?.enqueueTs;
+    const batchCommitTs = items[2]?.enqueueTs;
+    if (
+      typeof firstCommitTs !== "bigint" ||
+      typeof batchCommitTs !== "bigint"
+    ) {
+      throw new Error("Committed queue items must have resolved commit timestamps");
+    }
+    expect(batchCommitTs).toBe(items[3]?.enqueueTs);
+    expect(firstCommitTs < batchCommitTs).toBe(true);
+  });
+
+  test("fifo enqueue keeps a committed delayed head ahead of a ready tail", async () => {
+    const t = initConvexTest();
+    const queueId = "queue-fifo-snapshot-head";
+    const headVestingTime = Date.now() + 60_000;
+
+    await t.mutation(api.config.update, {
+      defaultOrderBy: "fifo",
+      managerSlots: 0,
+    });
+    await t.mutation(api.lib.enqueue, {
+      queueId,
+      payload: { tag: "delayed-head" },
+      handler: "noop",
+      handlerType: "action",
+      runAt: headVestingTime,
+    });
+    await t.mutation(api.lib.enqueue, {
+      queueId,
+      payload: { tag: "ready-tail" },
+      handler: "noop",
+      handlerType: "action",
+    });
+
+    const pointer = await t.run(async (ctx) =>
+      ctx.db
+        .query("queuePointers")
+        .withIndex("by_queue", (q) => q.eq("queueId", queueId))
+        .unique(),
+    );
+    const leased = await t.mutation(internal.lib.dequeue, {
+      queueId,
+      limit: 1,
+      orderBy: "fifo",
+    });
+
+    expect(pointer?.vestingTime).toBe(headVestingTime);
+    expect(leased).toHaveLength(0);
+  });
+
+  test("fifo batch uses its first pending item when the head snapshot is empty", async () => {
+    const t = initConvexTest();
+    const queueId = "queue-fifo-pending-batch-head";
+    const headVestingTime = Date.now() + 60_000;
+
+    await t.mutation(api.config.update, {
+      defaultOrderBy: "fifo",
+      managerSlots: 0,
+    });
+    await t.mutation(api.lib.enqueueBatch, {
+      items: [
+        {
+          queueId,
+          payload: { tag: "delayed-head" },
+          handler: "noop",
+          handlerType: "action",
+          runAt: headVestingTime,
+        },
+        {
+          queueId,
+          payload: { tag: "ready-tail" },
+          handler: "noop",
+          handlerType: "action",
+        },
+      ],
+    });
+
+    const pointer = await t.run(async (ctx) =>
+      ctx.db
+        .query("queuePointers")
+        .withIndex("by_queue", (q) => q.eq("queueId", queueId))
+        .unique(),
+    );
+    const leased = await t.mutation(internal.lib.dequeue, {
+      queueId,
+      limit: 1,
+      orderBy: "fifo",
+    });
+
+    expect(pointer?.vestingTime).toBe(headVestingTime);
+    expect(leased).toHaveLength(0);
+  });
+
   test("enqueue rejects priorities outside the supported range", async () => {
     const t = initConvexTest();
 
@@ -1770,7 +1920,7 @@ describe("component runtime execution", () => {
     }
   });
 
-  test("enqueue does not recover a healthy leased pointer while work is still in flight", async () => {
+  test("enqueue skips queue inspection while a pointer lease is within recovery grace", async () => {
     const t = initConvexTest();
     const now = Date.now();
     const queueId = "queue-healthy-leased-pointer";
@@ -1836,7 +1986,7 @@ describe("component runtime execution", () => {
       expect(slot?.leaseId).toBe("healthy-manager-slot");
       expect(slot?.leaseExpiry).toBe(now + 600_000);
       expect(infoSpy).toHaveBeenCalledWith(
-        "[quick] enqueue skipped pointer promotion because queue still has leased work",
+        "[quick] enqueue skipped pointer promotion because pointer lease is still within recovery grace",
         expect.objectContaining({ queueId }),
       );
     } finally {

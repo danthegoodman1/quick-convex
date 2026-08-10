@@ -4,6 +4,9 @@ import { v } from "convex/values"
 export default defineSchema({
   queueItems: defineTable({
     queueId: v.string(),
+    // Optional so items written before commit timestamps were introduced drain
+    // before newly enqueued work after an upgrade.
+    enqueueTs: v.optional(v.commitTs()),
     priority: v.number(),
     payload: v.any(),
     handler: v.string(),
@@ -30,7 +33,7 @@ export default defineSchema({
     errorCount: v.number(),
   })
     .index("by_queue_priority_and_vesting_time", ["queueId", "priority", "vestingTime"])
-    .index("by_queue_fifo", ["queueId"]),
+    .index("by_queue_fifo", ["queueId", "enqueueTs"]),
 
   queuePointers: defineTable({
     queueId: v.string(),

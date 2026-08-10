@@ -228,6 +228,9 @@ If you use the class API, the same control is available as
 ## Queue behavior
 
 - Supports `"vesting"` and `"fifo"` order modes.
+- FIFO items are ordered by Convex commit timestamp, so concurrent enqueues
+  follow transaction commit order. Items queued by older Quick versions drain
+  before timestamped items after upgrade.
 - Uses pointer-based scanning and leasing for concurrent processing.
 - `managerSlots` controls maximum concurrently running managers (default `10`).
 - `managerSlots: 0` pauses new manager claims until the value is raised and the scanner is kicked.
