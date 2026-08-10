@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.13
+
+- Reduce FIFO enqueue/dequeue OCC contention.
+- Order FIFO items by Convex commit timestamp while preserving legacy items.
+- Update Convex to 1.43.0.
+
 ## 0.2.11
 
 ## 0.2.10
